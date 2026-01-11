@@ -168,18 +168,23 @@ class LocalZoteroReader:
         return None
 
     def _extract_text_from_pdf(self, file_path: Path) -> str:
-        """Extract text from a PDF using pdfminer with a page cap to avoid stalls."""
+        """Extract text from a PDF using pdfminer with a page cap to avoid stalls.
+
+        Default is 3 pages, optimized to match the 10k character truncation limit.
+        Analysis shows ~3,266 chars/page average, so 3 pages ≈ 10k chars.
+        """
         try:
             from pdfminer.high_level import extract_text  # type: ignore
-            # Determine page cap: config value > env > default (10)
+            # Determine page cap: config value > env > default (3)
+            # Default changed from 10 to 3 to match 10k char truncation limit
             if isinstance(self.pdf_max_pages, int) and self.pdf_max_pages > 0:
                 maxpages = self.pdf_max_pages
             else:
                 max_pages_env = os.getenv("ZOTERO_PDF_MAXPAGES")
                 try:
-                    maxpages = int(max_pages_env) if max_pages_env else 10
+                    maxpages = int(max_pages_env) if max_pages_env else 3
                 except ValueError:
-                    maxpages = 10
+                    maxpages = 3
             text = extract_text(str(file_path), maxpages=maxpages)
             return text or ""
         except Exception:

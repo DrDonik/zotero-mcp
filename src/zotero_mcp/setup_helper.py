@@ -281,8 +281,10 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
     # Configure extraction settings
     print("\n=== Content Extraction Settings ===")
     print("Set a page cap for PDF extraction to balance speed vs. coverage.")
+    print("Text is truncated to 10k chars for embeddings (~3 pages average).")
+    print("Recommended: 3 pages (optimized to match 10k char limit)")
     print("Press Enter to use the default.")
-    default_pdf_max = existing_semantic_config.get("extraction", {}).get("pdf_max_pages", 10) if existing_semantic_config else 10
+    default_pdf_max = existing_semantic_config.get("extraction", {}).get("pdf_max_pages", 3) if existing_semantic_config else 3
     while True:
         raw = input(f"PDF max pages [{default_pdf_max}]: ").strip()
         if raw == "":
