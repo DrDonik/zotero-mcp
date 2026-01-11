@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import logging
@@ -159,6 +160,9 @@ class ChromaClient:
 
         self.persist_directory = persist_directory
 
+        # Path to store embedding model metadata
+        self.metadata_file = Path(self.persist_directory) / ".embedding_model_info"
+
         # Initialize ChromaDB client with stdout suppression
         with suppress_stdout():
             self.client = chromadb.PersistentClient(
@@ -175,26 +179,106 @@ class ChromaClient:
             # Get or create collection with embedding function handling
             try:
                 # Try to get existing collection first
-                self.collection = self.client.get_collection(name=self.collection_name)
+                # IMPORTANT: Must pass embedding_function to get_collection to avoid mismatch
+                self.collection = self.client.get_collection(
+                    name=self.collection_name,
+                    embedding_function=self.embedding_function
+                )
 
-                # Check if embedding functions are compatible
-                existing_ef = getattr(self.collection, '_embedding_function', None)
-                if existing_ef is not None:
-                    existing_name = getattr(existing_ef, 'name', lambda: 'default')()
-                    new_name = getattr(self.embedding_function, 'name', lambda: 'default')()
+                # Check if embedding model matches what was used to create the collection
+                stored_model_info = self._load_embedding_model_info()
+                current_model_info = self._get_current_model_info()
 
-                    if existing_name != new_name:
-                        # Log to stderr instead of letting ChromaDB print to stdout
-                        sys.stderr.write(f"ChromaDB: Collection exists with different embedding function: {existing_name} vs {new_name}\n")
-                        # Use the existing collection's embedding function to avoid conflicts
-                        self.embedding_function = existing_ef
+                if stored_model_info and stored_model_info != current_model_info:
+                    # Embedding function has changed - need to rebuild collection
+                    sys.stderr.write(f"\n⚠️  WARNING: Embedding model mismatch detected!\n")
+                    sys.stderr.write(f"   Database uses: '{stored_model_info}'\n")
+                    sys.stderr.write(f"   Config specifies: '{current_model_info}'\n")
+                    sys.stderr.write(f"   → Auto-rebuilding collection with correct embedding model...\n\n")
 
-            except Exception:
-                # Collection doesn't exist, create it
+                    # Delete the old collection to avoid dimension mismatches
+                    try:
+                        self.client.delete_collection(name=self.collection_name)
+                        logger.info(f"Deleted collection with incompatible embedding function: {stored_model_info}")
+                    except Exception as e:
+                        logger.warning(f"Could not delete old collection: {e}")
+
+                    # Create new collection with correct embedding function
+                    self.collection = self.client.create_collection(
+                        name=self.collection_name,
+                        embedding_function=self.embedding_function
+                    )
+
+                    # Save the new model info
+                    self._save_embedding_model_info()
+
+                    sys.stderr.write(f"✓ Collection recreated with '{current_model_info}' embeddings.\n")
+                    sys.stderr.write(f"  Run 'zotero-mcp update-db' to rebuild the database.\n\n")
+                elif not stored_model_info:
+                    # No metadata file exists yet - save it now
+                    self._save_embedding_model_info()
+
+            except Exception as e:
+                # Collection doesn't exist or error getting it - create new one
+                if "does not exist" not in str(e).lower():
+                    logger.warning(f"Error getting collection, creating new one: {e}")
+
                 self.collection = self.client.create_collection(
                     name=self.collection_name,
                     embedding_function=self.embedding_function
                 )
+
+                # Save the embedding model info
+                self._save_embedding_model_info()
+
+    def _get_current_model_info(self) -> str:
+        """
+        Get a string representation of the current embedding model configuration.
+
+        Returns:
+            String like "openai:text-embedding-3-large" or "default"
+        """
+        if self.embedding_model == "openai":
+            model_name = self.embedding_config.get("model_name", "text-embedding-3-small")
+            return f"openai:{model_name}"
+        elif self.embedding_model == "gemini":
+            model_name = self.embedding_config.get("model_name", "models/text-embedding-004")
+            return f"gemini:{model_name}"
+        elif self.embedding_model in ["qwen", "embeddinggemma"]:
+            return self.embedding_model
+        elif self.embedding_model != "default":
+            # Custom HuggingFace model
+            return f"huggingface:{self.embedding_model}"
+        else:
+            return "default"
+
+    def _load_embedding_model_info(self) -> str | None:
+        """
+        Load stored embedding model info from metadata file.
+
+        Returns:
+            Stored model info string, or None if not found
+        """
+        try:
+            if self.metadata_file.exists():
+                with open(self.metadata_file) as f:
+                    data = json.load(f)
+                    return data.get("embedding_model_info")
+        except Exception as e:
+            logger.warning(f"Could not load embedding model metadata: {e}")
+        return None
+
+    def _save_embedding_model_info(self) -> None:
+        """Save current embedding model info to metadata file."""
+        try:
+            self.metadata_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.metadata_file, 'w') as f:
+                json.dump({
+                    "embedding_model_info": self._get_current_model_info(),
+                    "timestamp": datetime.now().isoformat()
+                }, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save embedding model metadata: {e}")
 
     def _create_embedding_function(self) -> EmbeddingFunction:
         """Create the appropriate embedding function based on configuration."""
@@ -344,6 +428,8 @@ class ChromaClient:
                 name=self.collection_name,
                 embedding_function=self.embedding_function
             )
+            # Save the embedding model info for the new collection
+            self._save_embedding_model_info()
             logger.info(f"Reset ChromaDB collection '{self.collection_name}'")
         except Exception as e:
             logger.error(f"Error resetting collection: {e}")
@@ -407,30 +493,40 @@ def create_chroma_client(config_path: str | None = None) -> ChromaClient:
     if env_embedding_model:
         config["embedding_model"] = env_embedding_model
 
-    # Set up embedding config from environment
+    # Merge embedding config from environment (environment overrides file for specific keys)
     if config["embedding_model"] == "openai":
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        openai_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-        openai_base_url = os.getenv("OPENAI_BASE_URL")
-        if openai_api_key:
-            config["embedding_config"] = {
-                "api_key": openai_api_key,
-                "model_name": openai_model
-            }
-            if openai_base_url:
-                config["embedding_config"]["base_url"] = openai_base_url
+        # Start with file config or empty dict
+        embedding_config = config.get("embedding_config", {}).copy()
+
+        # Override with environment variables if present
+        if openai_api_key := os.getenv("OPENAI_API_KEY"):
+            embedding_config["api_key"] = openai_api_key
+        if openai_model := os.getenv("OPENAI_EMBEDDING_MODEL"):
+            embedding_config["model_name"] = openai_model
+        elif "model_name" not in embedding_config:
+            # Default model if not in file or environment
+            embedding_config["model_name"] = "text-embedding-3-small"
+        if openai_base_url := os.getenv("OPENAI_BASE_URL"):
+            embedding_config["base_url"] = openai_base_url
+
+        config["embedding_config"] = embedding_config
 
     elif config["embedding_model"] == "gemini":
-        gemini_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        gemini_model = os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004")
-        gemini_base_url = os.getenv("GEMINI_BASE_URL")
-        if gemini_api_key:
-            config["embedding_config"] = {
-                "api_key": gemini_api_key,
-                "model_name": gemini_model
-            }
-            if gemini_base_url:
-                config["embedding_config"]["base_url"] = gemini_base_url
+        # Start with file config or empty dict
+        embedding_config = config.get("embedding_config", {}).copy()
+
+        # Override with environment variables if present
+        if gemini_api_key := (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+            embedding_config["api_key"] = gemini_api_key
+        if gemini_model := os.getenv("GEMINI_EMBEDDING_MODEL"):
+            embedding_config["model_name"] = gemini_model
+        elif "model_name" not in embedding_config:
+            # Default model if not in file or environment
+            embedding_config["model_name"] = "models/text-embedding-004"
+        if gemini_base_url := os.getenv("GEMINI_BASE_URL"):
+            embedding_config["base_url"] = gemini_base_url
+
+        config["embedding_config"] = embedding_config
 
     return ChromaClient(
         collection_name=config["collection_name"],
