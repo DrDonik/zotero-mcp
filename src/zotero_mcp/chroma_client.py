@@ -11,6 +11,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 
 from zotero_mcp.utils import install_hint, suppress_stdout
@@ -1028,6 +1029,42 @@ class ChromaClient:
         except Exception as e:
             logger.error(f"Error listing collection ids: {e}")
             return set()
+
+    def iter_metadatas(self, batch_size: int = 500) -> Iterator[tuple[list[str], list[dict[str, Any]]]]:
+        """Page through the whole collection, yielding ``(ids, metadatas)`` batches.
+
+        Bounded batches rather than one unbounded ``get()``: Chroma's SQLite
+        backend binds one parameter per returned row, and past a few tens of
+        thousands of rows a single call raises ``too many SQL variables``
+        (same reason ``db-inspect`` pages).
+
+        Callers may rewrite metadata as they iterate — ``update_metadatas()``
+        changes neither ids nor row count, so offset paging stays stable.
+        """
+        total = self.collection.count()
+        offset = 0
+        while offset < total:
+            batch = self.collection.get(limit=batch_size, offset=offset, include=["metadatas"])
+            ids = batch.get("ids", [])
+            if not ids:
+                break
+            metadatas = batch.get("metadatas") or [{}] * len(ids)
+            yield ids, [m or {} for m in metadatas]
+            offset += batch_size
+
+    def update_metadatas(self, ids: list[str], metadatas: list[dict[str, Any]]) -> None:
+        """Replace the metadata of existing documents, leaving embeddings alone.
+
+        ``collection.update()`` without ``documents`` or ``embeddings`` touches
+        only the metadata rows, so this is safe to run over a whole collection:
+        no re-embedding, no id churn. Metadata is *replaced*, not merged, so
+        callers must pass the full dict they want stored.
+        """
+        if not ids:
+            return
+        for start in range(0, len(ids), 500):
+            chunk = slice(start, start + 500)
+            self.collection.update(ids=ids[chunk], metadatas=metadatas[chunk])
 
 
 def create_chroma_client(config_path: str | None = None) -> ChromaClient:
