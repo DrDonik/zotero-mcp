@@ -4,27 +4,22 @@ Check ChromaDB for items with PDF attachments but missing/empty fulltext.
 This queries the existing semantic search database instead of re-extracting.
 """
 
-import sys
-from pathlib import Path
 import csv
 import json
 import sqlite3
-import platform
+import sys
 
 from .chroma_client import create_chroma_client
+from .local_db import LocalZoteroReader
 
 
 def find_zotero_db():
-    """Find the Zotero database location based on OS."""
-    system = platform.system()
-    if system == "Darwin":
-        db_path = Path.home() / "Zotero" / "zotero.sqlite"
-    else:
-        db_path = Path.home() / "Zotero" / "zotero.sqlite"
+    """Find the Zotero database location.
 
-    if not db_path.exists():
-        raise FileNotFoundError(f"Zotero database not found at {db_path}")
-    return str(db_path)
+    Delegates to LocalZoteroReader so this command honours ZOTERO_DB_PATH and a
+    custom dataDir from Zotero's preferences, exactly like semantic search does.
+    """
+    return LocalZoteroReader().db_path
 
 
 def get_items_with_pdf_attachments():

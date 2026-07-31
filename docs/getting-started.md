@@ -7,7 +7,7 @@ This guide will walk you through the setup and basic usage of the Zotero MCP ser
 First, install the Zotero MCP server using pip:
 
 ```bash
-pip install zotero-mcp
+pip install zotero-mcp-server
 ```
 
 ## Configuration
@@ -55,6 +55,13 @@ To use Zotero MCP with Claude Desktop:
 2. Open your Claude Desktop configuration:
    - On macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
    - On Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+   Some Claude Desktop builds store the file elsewhere, for example
+   `%LOCALAPPDATA%\Claude-3p\claude_desktop_config.json` on Windows or
+   `~/Library/Application Support/Claude-3p/claude_desktop_config.json` on macOS.
+   `zotero-mcp setup` probes all of these locations, writes to every
+   `claude_desktop_config.json` it finds, and prints the absolute path(s) it
+   wrote so you can confirm it matched the build you actually run.
 
 3. Add the Zotero MCP server to the configuration:
    ```json
@@ -151,7 +158,7 @@ To set up Zotero MCP with Chorus.sh:
 
 1. **Find your installation path**:
    - For uv: typically `/Users/USERNAME/.pyenv/versions/3.12.8/bin/zotero-mcp` on macOS
-   - For other methods: use `zotero-mcp --setup-info` to get the exact path and configuration details
+   - For other methods: use `zotero-mcp setup-info` to get the exact path and configuration details
 
 2. **Configure in Chorus.sh preferences**:
    - **Command**: Enter the full path to your zotero-mcp installation
@@ -170,13 +177,13 @@ Many other MCP consumers use similar configuration approaches with command path,
 Zotero MCP works with any MCP-compatible client. You can start the server manually:
 
 ```bash
-zotero-mcp --transport stdio
+zotero-mcp serve --transport stdio
 ```
 
 For HTTP/SSE-based clients:
 
 ```bash
-zotero-mcp --transport sse --host localhost --port 8000
+zotero-mcp serve --transport sse --host localhost --port 8000
 ```
 
 
@@ -185,7 +192,7 @@ zotero-mcp --transport sse --host localhost --port 8000
 When connected to Claude Desktop or another MCP client, you'll have access to these tools:
 
 - **zotero_search_items**: Search your library by title, creator, or content
-- **zotero_get_item_metadata**: Get detailed information about a specific item
+- **zotero_get_item_metadata**: Get detailed information about a specific item, including complete raw metadata via `format="json"`
 - **zotero_get_item_fulltext**: Get the full text content of an item
 - **zotero_get_collections**: List all collections in your library
 - **zotero_get_collection_items**: Get all items in a specific collection
@@ -228,4 +235,4 @@ zotero-mcp update-db --force-rebuild
 
 Other than time waiting for the rebuild, there is generally little to no risk involved in triggering the rebuild - so if you're experiencing database-related issues, it's worth trying this command.
 
-For more help, try the discussions](https://github.com/54yyyu/zotero-mcp/discussions).
+For more help, try the [discussions](https://github.com/54yyyu/zotero-mcp/discussions).
