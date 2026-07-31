@@ -2,19 +2,146 @@
 Zotero client wrapper for MCP server.
 """
 
+import functools
 import os
+import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
+import httpx
 from dotenv import load_dotenv
 from markitdown import MarkItDown
 from pyzotero import zotero
 
-from zotero_mcp.utils import format_creators
+from zotero_mcp.utils import _paginate, format_creators
+from zotero_mcp.webdav import (
+    WebDAVNotConfiguredError,
+    download_attachment_from_webdav,
+)
 
 # Load environment variables
 load_dotenv()
+
+# Serialize all Zotero API access. The local API (port 23119) is single-threaded;
+# concurrent requests from parallel MCP tool threads queue at the network layer and
+# risk hitting pyzotero's 30s timeout. A process-local lock ensures only one
+# request is in-flight at a time — the rest queue in-process (microseconds) instead
+# of at the API (seconds/timeout). RLock allows nested calls from the same thread.
+_zotero_api_lock = threading.RLock()
+
+# Bound how long a tool will WAIT to acquire the lock before giving up. Without a
+# bound, a single slow/stuck op (e.g. a hung cloud write or PDF upload) holds the
+# lock and every other tool — reads included — blocks behind it until FastMCP's
+# ~60s client timeout fires, surfacing as an opaque "-32001 Request timed out" on
+# every queued call. A bounded acquire turns that into a fast, actionable error
+# for the *waiters* while leaving the in-flight op untouched. Keep this safely
+# below the client timeout. Override via ZOTERO_MCP_LOCK_TIMEOUT (seconds; <=0
+# restores the old unbounded behaviour).
+_DEFAULT_LOCK_TIMEOUT = 45.0
+
+
+def _lock_timeout() -> float:
+    raw = os.getenv("ZOTERO_MCP_LOCK_TIMEOUT", "").strip()
+    if not raw:
+        return _DEFAULT_LOCK_TIMEOUT
+    try:
+        return float(raw)
+    except ValueError:
+        return _DEFAULT_LOCK_TIMEOUT
+
+
+class ZoteroApiBusyError(RuntimeError):
+    """Raised when the per-process Zotero API lock can't be acquired in time.
+
+    Signals that another Zotero operation is still in flight (likely slow or
+    stuck) — not that this call itself failed. Callers should surface a clear,
+    retryable message rather than letting the request hang to a timeout.
+    """
+
+
+def with_zotero_api_lock(func):
+    """Serialize Zotero API access across concurrent MCP tool threads.
+
+    Acquires the shared RLock with a bounded wait so a stuck op can't wedge
+    every other tool into an opaque client timeout. The lock is reentrant, so
+    nested decorated calls on the same thread (e.g. add_by_url -> add_by_doi)
+    acquire instantly and are never blocked by this bound.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        timeout = _lock_timeout()
+        if timeout <= 0:
+            # Opt-out: original unbounded behaviour.
+            with _zotero_api_lock:
+                return func(*args, **kwargs)
+        acquired = _zotero_api_lock.acquire(timeout=timeout)
+        if not acquired:
+            raise ZoteroApiBusyError(
+                f"Another Zotero API operation is still in progress and did not "
+                f"release within {timeout:.0f}s. This usually means a previous "
+                f"call is slow or stuck (e.g. a large PDF upload or an "
+                f"unreachable Zotero cloud). Please retry shortly; if it "
+                f"persists, restart the Zotero MCP server."
+            )
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _zotero_api_lock.release()
+    return wrapper
+
+
+# Runtime library override state — set by zotero_switch_library tool.
+# When non-empty, these values override the corresponding environment variables
+# in get_zotero_client(). Keys: "library_id", "library_type".
+_active_library_override: dict[str, str] = {}
+
+
+def set_active_library(library_id: str, library_type: str) -> None:
+    """Set runtime library override for all subsequent get_zotero_client() calls."""
+    _active_library_override["library_id"] = library_id
+    _active_library_override["library_type"] = library_type
+
+
+def clear_active_library() -> None:
+    """Clear runtime library override, reverting to environment variable defaults."""
+    _active_library_override.clear()
+
+
+def get_active_library() -> dict[str, str]:
+    """Return the current active library override (empty dict if using defaults)."""
+    return dict(_active_library_override)
+
+
+def get_active_group_id() -> int:
+    """group_id (0 = personal, else Zotero groupID) of the library
+    ``get_zotero_client()`` is currently scoped to."""
+    
+    override = _active_library_override
+    library_id = override.get("library_id") or os.getenv("ZOTERO_LIBRARY_ID") or "0"
+    library_type = override.get("library_type") or os.getenv("ZOTERO_LIBRARY_TYPE", "user")
+    if library_type == "group":
+        try:
+            return int(library_id)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _make_local_http_client() -> httpx.Client:
+    """Return an httpx.Client pinned to HTTP/1.1 for the local Zotero server.
+
+    Zotero 8's local server (port 23119) only speaks HTTP/1.0. httpx defaults
+    to attempting HTTP/2 negotiation, which the local server rejects with 502
+    Bad Gateway — every tool call fails even though the MCP starts cleanly
+    (#160). Forcing http1=True / http2=False on the transport keeps requests
+    on HTTP/1.1 and the local API answers normally.
+    """
+    return httpx.Client(
+        transport=httpx.HTTPTransport(http1=True, http2=False),
+        follow_redirects=True,
+    )
 
 
 @dataclass
@@ -27,9 +154,21 @@ class AttachmentDetails:
     content_type: str
 
 
+@dataclass
+class AttachmentDownloadResult:
+    """Result of downloading an attachment from one of the supported sources."""
+
+    path: Path | None
+    source: str | None
+    errors: list[str]
+
+
 def get_zotero_client() -> zotero.Zotero:
     """
     Get authenticated Zotero client using environment variables.
+
+    If a runtime library override is active (via set_active_library()),
+    those values take precedence over environment variables.
 
     Returns:
         A configured Zotero client instance.
@@ -37,8 +176,10 @@ def get_zotero_client() -> zotero.Zotero:
     Raises:
         ValueError: If required environment variables are missing.
     """
-    library_id = os.getenv("ZOTERO_LIBRARY_ID")
-    library_type = os.getenv("ZOTERO_LIBRARY_TYPE", "user")
+    # Runtime overrides take precedence over environment variables
+    override = _active_library_override
+    library_id = override.get("library_id") or os.getenv("ZOTERO_LIBRARY_ID")
+    library_type = override.get("library_type") or os.getenv("ZOTERO_LIBRARY_TYPE", "user")
     api_key = os.getenv("ZOTERO_API_KEY")
     local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
 
@@ -58,7 +199,68 @@ def get_zotero_client() -> zotero.Zotero:
         library_type=library_type,
         api_key=api_key,
         local=local,
+        client=_make_local_http_client() if local else None,
     )
+
+
+def get_local_zotero_client() -> zotero.Zotero | None:
+    """
+    Get a local Zotero client for file access (WebDAV/local storage).
+
+    This client connects to the local Zotero instance running on port 23119.
+    It's useful for accessing PDF files stored via WebDAV when the main
+    client is configured for web API.
+
+    Returns:
+        A local Zotero client instance, or None if local Zotero is not available.
+    """
+    try:
+        # Create a local client - library_id 0 is the default for local.
+        # HTTP/1.1-only transport for compatibility with Zotero 8's local
+        # server (#160) — httpx default HTTP/2 negotiation returns 502.
+        client = zotero.Zotero(
+            library_id="0",
+            library_type="user",
+            api_key=None,
+            local=True,
+            client=_make_local_http_client(),
+        )
+        # Test connection by making a simple request
+        client.items(limit=1)
+        return client
+    except Exception:
+        return None
+
+
+def get_web_zotero_client() -> zotero.Zotero | None:
+    """
+    Get a web API Zotero client for write operations.
+
+    This client connects to the Zotero web API and can create/modify items.
+    Requires ZOTERO_API_KEY and ZOTERO_LIBRARY_ID environment variables.
+
+    Returns:
+        A web API Zotero client instance, or None if credentials are not available.
+    """
+    library_id = os.getenv("ZOTERO_LIBRARY_ID")
+    library_type = os.getenv("ZOTERO_LIBRARY_TYPE", "user")
+    api_key = os.getenv("ZOTERO_API_KEY")
+
+    if not library_id or not api_key:
+        return None
+
+    return zotero.Zotero(
+        library_id=library_id,
+        library_type=library_type,
+        api_key=api_key,
+        local=False,
+    )
+
+
+def is_local_zotero_available() -> bool:
+    """Check if local Zotero instance is running and accessible."""
+    client = get_local_zotero_client()
+    return client is not None
 
 
 def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) -> str:
@@ -82,6 +284,13 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
         f"**Item Key:** {data.get('key')}",
     ]
 
+    # Trash status. The Zotero web API returns data.deleted=1 for items in
+    # the Trash; prior versions silently rendered trashed items as if live,
+    # so agents reasoning about "current" state could cite papers the user
+    # had explicitly removed. Surface it near the top where it's hard to miss.
+    if data.get("deleted"):
+        lines.append("**Status:** 🗑️ In Trash (recoverable from Zotero Trash view)")
+
     # Date
     if date := data.get("date"):
         lines.append(f"**Date:** {date}")
@@ -101,16 +310,27 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
             if pages := data.get("pages"):
                 journal_info += f", Pages {pages}"
             lines.append(journal_info)
-    elif item_type == "book":
-        if publisher := data.get("publisher"):
-            book_info = f"**Publisher:** {publisher}"
-            if place := data.get("place"):
-                book_info += f", {place}"
-            lines.append(book_info)
+    elif item_type == "bookSection":
+        if book_title := data.get("bookTitle"):
+            lines.append(f"**Book:** {book_title}")
+        if pages := data.get("pages"):
+            lines.append(f"**Pages:** {pages}")
 
-    # DOI and URL
+    # Publisher and place — emitted as independent labeled lines for any
+    # item type that has them (book, bookSection, thesis, report, etc.).
+    # Round-trip parity: agents that read these need a stable, labeled form.
+    if publisher := data.get("publisher"):
+        lines.append(f"**Publisher:** {publisher}")
+    if place := data.get("place"):
+        lines.append(f"**Place:** {place}")
+
+    # Identifiers and URL
     if doi := data.get("DOI"):
         lines.append(f"**DOI:** {doi}")
+    if isbn := data.get("ISBN"):
+        lines.append(f"**ISBN:** {isbn}")
+    if issn := data.get("ISSN"):
+        lines.append(f"**ISSN:** {issn}")
     if url := data.get("url"):
         lines.append(f"**URL:** {url}")
 
@@ -124,7 +344,7 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
                 key_part = line.split(":", 1)[1].strip() if ":" in line else line.strip()
                 lines.append(f"**Citation Key (from Extra):** {key_part}")
                 break
-    
+
     # Tags
     if tags := data.get("tags"):
         tag_list = [f"`{tag['tag']}`" for tag in tags]
@@ -135,10 +355,21 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
     if include_abstract and (abstract := data.get("abstractNote")):
         lines.extend(["", "## Abstract", abstract])
 
-    # Collections
+    # Related Items (dc:relation URIs → item keys)
+    dc_relations = data.get("relations", {}).get("dc:relation", [])
+    if isinstance(dc_relations, str):
+        dc_relations = [dc_relations]
+    if dc_relations:
+        related_keys = [uri.rstrip("/").split("/")[-1] for uri in dc_relations]
+        lines.extend(["", "## Related Items", *[f"- {k}" for k in related_keys]])
+
+    # Collections — list actual keys rather than a bare count. The Zotero
+    # web API does NOT cascade collection-delete to items, so the array
+    # can contain dangling references to collections that no longer exist.
+    # Showing the keys lets agents verify against zotero_search_collections
+    # instead of trusting a potentially stale count.
     if collections := data.get("collections", []):
-        if collections:
-            lines.append(f"**Collections:** {len(collections)} collections")
+        lines.append(f"**Collections:** {', '.join(collections)}")
 
     # Notes - this requires additional API calls, so we just indicate if there are notes
     if "meta" in item and item["meta"].get("numChildren", 0) > 0:
@@ -208,11 +439,15 @@ def generate_bibtex(item: dict[str, Any]) -> str:
     field_mappings = [
         ("title", "title"),
         ("publicationTitle", "journal"),
+        ("bookTitle", "booktitle"),
         ("volume", "volume"),
         ("issue", "number"),
         ("pages", "pages"),
         ("publisher", "publisher"),
+        ("place", "address"),
         ("DOI", "doi"),
+        ("ISBN", "isbn"),
+        ("ISSN", "issn"),
         ("url", "url"),
         ("abstractNote", "abstract")
     ]
@@ -262,7 +497,9 @@ def get_attachment_details(
     """
     data = item.get("data", {})
     item_type = data.get("itemType")
-    item_key = data.get("key")
+    # Top-level "key" is the reliable one: some API responses (and the local
+    # Zotero server) omit it from the nested data object (#372).
+    item_key = data.get("key") or item.get("key")
 
     # Direct attachment
     if item_type == "attachment":
@@ -275,7 +512,7 @@ def get_attachment_details(
 
     # For regular items, look for child attachments
     try:
-        children = zot.children(item_key)
+        children = _paginate(zot.children, item_key)
 
         # Group attachments by content type
         pdfs = []
@@ -318,6 +555,142 @@ def get_attachment_details(
         pass
 
     return None
+
+
+def download_attachment_file(
+    attachment_key: str,
+    destination_dir: str | Path,
+    filename: str | None = None,
+    *,
+    local_client: zotero.Zotero | None = None,
+    web_client: zotero.Zotero | None = None,
+    enable_webdav: bool = True,
+) -> AttachmentDownloadResult:
+    """
+    Download an attachment using the best available source.
+
+    The fallback order is:
+    1. local Zotero storage, resolved straight off the local SQLite DB
+    2. local Zotero API (works with local storage or desktop-managed WebDAV)
+    3. Direct WebDAV access via environment variables
+    4. Zotero Web API (works with Zotero cloud storage)
+
+    Step 1 exists because none of the later steps can serve a *linked* file.
+    The local API answers ``/file`` for a linked attachment with a 302 to a
+    ``file://`` URL, which httpx refuses to follow ("unsupported protocol"),
+    and a linked file is by definition never uploaded to WebDAV or Zotero
+    storage — so all three remaining sources fail on an attachment that is
+    sitting readable on the same disk. Reading the path out of the DB avoids
+    the redirect entirely and is faster for ordinary stored files too.
+    """
+    destination = Path(destination_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    target_name = Path(filename or f"{attachment_key}.bin").name
+    target_path = destination / target_name
+    errors: list[str] = []
+
+    def _cleanup_target() -> None:
+        if target_path.exists() and target_path.stat().st_size == 0:
+            target_path.unlink()
+
+    def _try_local_storage() -> AttachmentDownloadResult | None:
+        """Resolve the attachment off disk via the local Zotero SQLite DB.
+
+        Gated on local mode so a web-API user pointed at a group library never
+        matches an unrelated same-key row in a personal DB that happens to
+        exist on the machine.
+        """
+        try:
+            from zotero_mcp.config import load_config
+            from zotero_mcp.local_db import LocalZoteroReader
+            from zotero_mcp.utils import is_local_mode
+
+            if not is_local_mode():
+                return None
+
+            with LocalZoteroReader(db_path=load_config().resolve_zotero_db_path()) as reader:
+                attachment = reader.get_attachment_by_key(attachment_key)
+                if attachment is None:
+                    return None
+
+                resolved = reader._resolve_attachment_path(
+                    attachment_key, attachment["zotero_path"] or ""
+                )
+                if not (resolved and resolved.exists()):
+                    # Recorded filename drifted on disk — scan the folder (#291)
+                    resolved = reader._scan_storage_for_attachment(
+                        attachment_key, attachment["content_type"]
+                    )
+                if not (resolved and resolved.exists() and resolved.stat().st_size > 0):
+                    return None
+
+                # Copy rather than hand back the library path: callers treat
+                # the returned file as a scratch copy and delete it, which on
+                # a linked file would destroy the user's original (#372).
+                shutil.copyfile(resolved, target_path)
+                return AttachmentDownloadResult(
+                    path=target_path,
+                    source="Local storage",
+                    errors=errors,
+                )
+        except Exception as exc:
+            errors.append(f"Local storage: {exc}")
+            _cleanup_target()
+
+        return None
+
+    def _try_dump(label: str, zot_client: zotero.Zotero | None) -> AttachmentDownloadResult | None:
+        if zot_client is None:
+            return None
+
+        try:
+            zot_client.dump(attachment_key, filename=target_name, path=str(destination))
+            if target_path.exists() and target_path.stat().st_size > 0:
+                return AttachmentDownloadResult(
+                    path=target_path,
+                    source=label,
+                    errors=errors,
+                )
+            errors.append(f"{label}: file was not created")
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+        finally:
+            _cleanup_target()
+
+        return None
+
+    storage_result = _try_local_storage()
+    if storage_result:
+        return storage_result
+
+    local_result = _try_dump("Local Zotero", local_client)
+    if local_result:
+        return local_result
+
+    if enable_webdav:
+        try:
+            webdav_path = download_attachment_from_webdav(
+                attachment_key,
+                destination,
+                expected_filename=target_name,
+            )
+            if webdav_path.exists() and webdav_path.stat().st_size > 0:
+                return AttachmentDownloadResult(
+                    path=webdav_path,
+                    source="WebDAV",
+                    errors=errors,
+                )
+            errors.append("WebDAV: downloaded file was empty")
+        except WebDAVNotConfiguredError:
+            pass
+        except Exception as exc:
+            errors.append(f"WebDAV: {exc}")
+
+    web_result = _try_dump("Web API", web_client)
+    if web_result:
+        return web_result
+
+    return AttachmentDownloadResult(path=None, source=None, errors=errors)
 
 
 def convert_to_markdown(file_path: str | Path) -> str:

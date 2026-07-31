@@ -1,4 +1,7 @@
 name: Build and publish to PyPI
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 on:
   push:
     tags:
@@ -11,10 +14,28 @@ on:
     - cron: '0 6 * * 1'
 
 jobs:
-  build-n-publish:
+  test:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-timeout fastmcp pyzotero python-dotenv markitdown[pdf] chromadb unidecode bibtexparser tiktoken pymupdf
+          python -m pip install -e . --no-deps
+      - name: Run tests
+        run: pytest --ignore=tests/test_lifespan.py
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -24,7 +45,66 @@ jobs:
         run: |
           pip install build
           python -m build
-      - name: Publish package to PyPI
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags')
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags')
+    permissions:
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/project/zotero-mcp-server/
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-registry:
+    needs: publish
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags')
+    permissions:
+      id-token: write   # required for mcp-publisher's GitHub OIDC login
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Sync server.json version to the release tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+          cat server.json
+      - name: Wait for the release to appear on PyPI
+        # The registry verifies that the referenced version actually exists on PyPI,
+        # and the index can lag a few seconds behind the upload in the previous job.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for i in $(seq 1 30); do
+            if curl -sf "https://pypi.org/pypi/zotero-mcp-server/$VERSION/json" > /dev/null; then
+              echo "zotero-mcp-server $VERSION is live on PyPI"
+              exit 0
+            fi
+            echo "attempt $i: not on PyPI yet, retrying in 10s"
+            sleep 10
+          done
+          echo "zotero-mcp-server $VERSION never appeared on PyPI"
+          exit 1
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar xz mcp-publisher
+          sudo mv mcp-publisher /usr/local/bin/
+      - name: Publish to the MCP Registry
+        run: |
+          mcp-publisher login github-oidc
+          mcp-publisher publish
 

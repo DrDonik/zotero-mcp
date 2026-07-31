@@ -1,0 +1,1511 @@
+"""Retrieval tool functions — read-only access to Zotero items, collections, tags, libraries, and feeds."""
+
+import json
+import logging as _logging
+import os
+import re
+import tempfile
+import time as _time
+from typing import Literal
+
+from zotero_mcp import client as _client
+from zotero_mcp import utils as _utils
+from zotero_mcp._app import mcp
+from zotero_mcp._context import Context
+from zotero_mcp.client import with_zotero_api_lock
+from zotero_mcp.config import load_config
+from zotero_mcp.tools import _helpers
+
+
+@mcp.tool(
+    name="zotero_get_item_metadata",
+    description=(
+        "Fetch detailed metadata (title, creators, date, DOI, publisher, "
+        "tags, abstract, URL, etc.) for ONE Zotero item by key. "
+        "If the metadata and abstract don't contain what you need, call "
+        "zotero_get_item_fulltext to read the paper — but that is "
+        "resource-intensive (10K+ tokens) and should NEVER be used for "
+        "searching; use zotero_search_items or zotero_semantic_search "
+        "instead. "
+        "item_key: the 8-character Zotero item key (NOT a DOI or title). "
+        "include_abstract=True (default) includes the abstractNote in "
+        "markdown output; pass False to trim tokens when you don't need "
+        "it. (Ignored in bibtex/json formats.) "
+        "format='markdown' (default) returns a human-readable block; "
+        "format='json' returns the complete raw Zotero item record; "
+        "format='bibtex' returns a BibTeX citation string suitable for "
+        ".bib files. "
+        "Scope: active library only (switch with zotero_switch_library). "
+        "Unlike list endpoints, this returns items EVEN IF THEY ARE IN "
+        "THE TRASH — a Status: In Trash line is surfaced when the item "
+        "is trashed (recoverable via the Zotero UI). Collection "
+        "membership is shown as keys rather than a bare count so the "
+        "caller can verify entries against zotero_search_collections "
+        "(the Zotero API does not cascade collection-delete to items, "
+        "so dangling references can linger). "
+        "Example: zotero_get_item_metadata(item_key='RTKZQI8E', "
+        "format='bibtex')."
+    )
+)
+@with_zotero_api_lock
+def get_item_metadata(
+    item_key: str,
+    include_abstract: bool = True,
+    format: Literal["markdown", "bibtex", "json"] = "markdown",
+    *,
+    ctx: Context
+) -> str:
+    """
+    Get detailed metadata for a Zotero item.
+
+    Args:
+        item_key: Zotero item key/ID
+        include_abstract: Whether to include the abstract in the output (markdown format only)
+        format: Output format - 'markdown' for a readable summary, 'json' for
+            the complete raw Zotero item, or 'bibtex' for BibTeX citation
+        ctx: MCP context
+
+    Returns:
+        Formatted item metadata
+    """
+    _ret_logger = _logging.getLogger("zotero_mcp.retrieval")
+    try:
+        ctx.info(f"Fetching metadata for item {item_key} in {format} format")
+        zot = _client.get_zotero_client()
+
+        t0 = _time.monotonic()
+        item = zot.item(item_key)
+        _ret_logger.debug(f"[METADATA] zot.item({item_key}): {_time.monotonic() - t0:.2f}s")
+        if not item:
+            return f"No item found with key: {item_key}"
+
+        if format == "json":
+            return json.dumps(item, ensure_ascii=False, indent=2, sort_keys=True)
+        if format == "bibtex":
+            return _client.generate_bibtex(item)
+        return _client.format_item_metadata(item, include_abstract)
+
+    except Exception as e:
+        ctx.error(f"Error fetching item metadata: {str(e)}")
+        return f"Error fetching item metadata: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_get_item_fulltext",
+    description=(
+        "Return the full extracted text of a Zotero item's primary "
+        "attachment (PDF or EPUB). "
+        "WARNING: returns the entire paper (often 10K+ tokens). Use ONLY "
+        "when the user explicitly wants to READ the paper — not for "
+        "searching or browsing. For topic search use "
+        "zotero_semantic_search; for metadata only use "
+        "zotero_get_item_metadata. "
+        "Avoid calling this on multiple papers in one conversation unless "
+        "the user specifically asked to read several. "
+        "item_key: 8-character Zotero item key (parent item, not the "
+        "attachment). The tool locates the attached PDF/EPUB itself. "
+        "Scope: active library only. "
+        "Extraction path (in order): local Zotero storage via SQLite when "
+        "running in local mode (fastest, respects pdf_max_pages config); "
+        "Zotero's server-side fulltext index; direct download + PyMuPDF "
+        "parsing as a last resort. Image-only scanned PDFs without OCR "
+        "may return little or no text. "
+        "Example: zotero_get_item_fulltext(item_key='RTKZQI8E')."
+    )
+)
+@with_zotero_api_lock
+def get_item_fulltext(
+    item_key: str,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Get the full text content of a Zotero item.
+
+    Args:
+        item_key: Zotero item key/ID
+        ctx: MCP context
+
+    Returns:
+        Markdown-formatted item full text
+    """
+    try:
+        ctx.info(f"Fetching full text for item {item_key}")
+        zot = _client.get_zotero_client()
+
+        # First get the item metadata
+        item = zot.item(item_key)
+        if not item:
+            return f"No item found with key: {item_key}"
+
+        # Get item metadata in markdown format
+        metadata = _client.format_item_metadata(item, include_abstract=True)
+
+        # In local mode, prefer direct local DB/storage extraction first.
+        # This avoids pyzotero dump() failures on linked file:// attachments
+        # when using remote clients over SSE/HTTP.
+        local_extract_error_msg = None
+        try:
+            from zotero_mcp.local_db import LocalZoteroReader
+
+            if _utils.is_local_mode():
+                config = load_config()
+                zotero_db_path = config.resolve_zotero_db_path()
+                extraction = config.semantic_search.extraction
+                pdf_max_pages = extraction.pdf_max_pages
+                # Separate display limit for when Claude reads papers
+                # (reduces token usage vs. indexing which can be higher)
+                fulltext_display_max = extraction.fulltext_display_max_pages
+
+                # Use display limit if configured, otherwise fall back to
+                # pdf_max_pages, with a default cap of 10 pages.
+                DEFAULT_FULLTEXT_DISPLAY_MAX = 10
+                if fulltext_display_max is not None:
+                    pdf_max_pages = fulltext_display_max
+                elif pdf_max_pages is None:
+                    pdf_max_pages = DEFAULT_FULLTEXT_DISPLAY_MAX
+
+                with LocalZoteroReader(db_path=zotero_db_path, pdf_max_pages=pdf_max_pages) as reader:
+                    local_item = reader.get_item_by_key(item_key)
+                    if local_item:
+                        extracted = reader.extract_fulltext_for_item(local_item.item_id)
+                        if extracted and extracted[0]:
+                            # Skip timeout sentinel — don't show "__EXTRACTION_TIMEOUT__" as content
+                            if isinstance(extracted, tuple) and len(extracted) >= 2 and extracted[1] == "timeout":
+                                ctx.info("PDF extraction timed out — skipping local fulltext")
+                            else:
+                                source = extracted[1] if len(extracted) > 1 else "file"
+                                ctx.info(f"Retrieved full text from local storage ({source})")
+                                return _helpers._prepend_size_warning(
+                                    f"{metadata}\n\n---\n\n## Full Text\n\n{extracted[0]}",
+                                    "Consider using zotero_semantic_search to find specific content instead of reading full papers."
+                                )
+        except Exception as local_extract_error:
+            local_extract_error_msg = str(local_extract_error)
+            ctx.info(f"Local extraction fallback not available: {str(local_extract_error)}")
+
+        # Try to get attachment details
+        attachment = _client.get_attachment_details(zot, item)
+        if not attachment:
+            return f"{metadata}\n\n---\n\nNo suitable attachment found for this item."
+
+        ctx.info(f"Found attachment: {attachment.key} ({attachment.content_type})")
+
+        # Try fetching full text from Zotero's full text index first
+        try:
+            full_text_data = zot.fulltext_item(attachment.key)
+            if full_text_data and "content" in full_text_data and full_text_data["content"]:
+                ctx.info("Successfully retrieved full text from Zotero's index")
+                return _helpers._prepend_size_warning(
+                    f"{metadata}\n\n---\n\n## Full Text\n\n{full_text_data['content']}",
+                    "Consider using zotero_semantic_search to find specific content instead of reading full papers."
+                )
+        except Exception as fulltext_error:
+            ctx.info(f"Couldn't retrieve indexed full text: {str(fulltext_error)}")
+
+        # If we couldn't get indexed full text, try to download and convert the file
+        try:
+            ctx.info(f"Attempting to download and convert attachment {attachment.key}")
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                download = _client.download_attachment_file(
+                    attachment.key,
+                    tmpdir,
+                    attachment.filename or f"{attachment.key}.pdf",
+                    local_client=_client.get_local_zotero_client(),
+                    web_client=None if _utils.is_local_mode() else zot,
+                )
+
+                if download.path and download.path.exists():
+                    ctx.info(f"Downloaded file via {download.source} to {download.path}, converting to markdown")
+                    converted_text = _client.convert_to_markdown(download.path)
+                    return _helpers._prepend_size_warning(
+                        f"{metadata}\n\n---\n\n## Full Text\n\n{converted_text}",
+                        "Consider using zotero_semantic_search to find specific content instead of reading full papers."
+                    )
+
+                error_details = "\n".join(f"  - {err}" for err in download.errors) or "  - No download source succeeded"
+                return (
+                    f"{metadata}\n\n---\n\nFile download failed.\n\n"
+                    f"Attempted sources:\n{error_details}\n\n"
+                    "For WebDAV-backed attachments, configure "
+                    "ZOTERO_WEBDAV_URL / ZOTERO_WEBDAV_USERNAME / ZOTERO_WEBDAV_PASSWORD."
+                )
+        except Exception as download_error:
+            ctx.error(f"Error downloading/converting file: {str(download_error)}")
+            if local_extract_error_msg:
+                return (
+                    f"{metadata}\n\n---\n\nError accessing attachment: {str(download_error)}\n\n"
+                    f"Local extraction fallback error: {local_extract_error_msg}"
+                )
+            return f"{metadata}\n\n---\n\nError accessing attachment: {str(download_error)}"
+
+    except Exception as e:
+        ctx.error(f"Error fetching item full text: {str(e)}")
+        return f"Error fetching item full text: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_get_attachment_path",
+    description=(
+        "Return the local filesystem path(s) of a Zotero item's attachments. "
+        "Local mode only. Useful when you want to read a large PDF directly "
+        "(e.g., a book) instead of going through zotero_get_item_fulltext, "
+        "which is page-limited."
+    )
+)
+def get_attachment_path(
+    item_key: str,
+    *,
+    ctx: Context
+) -> str:
+    """List resolved local paths for an item's attachments."""
+    if not _utils.is_local_mode():
+        return (
+            "Error: zotero_get_attachment_path requires local mode "
+            "(set ZOTERO_LOCAL=true). Cloud-only attachments have no local path."
+        )
+    try:
+        from zotero_mcp.local_db import LocalZoteroReader
+
+        with LocalZoteroReader(db_path=load_config().resolve_zotero_db_path()) as reader:
+            attachments = reader.get_attachment_paths(item_key)
+
+        if not attachments:
+            return f"No attachments found for item `{item_key}`."
+
+        lines = [f"# Attachments for `{item_key}`", ""]
+        for att in attachments:
+            lines.append(f"## `{att['key']}` ({att['content_type'] or 'unknown'})")
+            lines.append(f"- Zotero path: `{att['zotero_path']}`")
+            if att["resolved_path"] is not None:
+                marker = "" if att["exists"] else " (missing on disk)"
+                lines.append(f"- Local path: `{att['resolved_path']}`{marker}")
+            else:
+                lines.append("- Local path: *unresolved*")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+    except Exception as e:
+        ctx.error(f"Error resolving attachment path: {e}")
+        return f"Error resolving attachment path: {e}"
+
+
+@mcp.tool(
+    name="zotero_get_collections",
+    description=(
+        "List all collections in the currently active Zotero library as a "
+        "hierarchical tree (parents and nested subcollections, each with its "
+        "8-character key). Use this when the user wants to see the full "
+        "library structure. "
+        "If you already know a name and just need the key, prefer "
+        "zotero_search_collections — it returns only matches. "
+        "Scope is limited to the active library — switch libraries with "
+        "zotero_switch_library before listing. Deep hierarchies render inline "
+        "without truncation, so very deep trees can be long. "
+        "limit: cap on collections returned; pass None (default) to use 100, "
+        "or raise to 5000 for libraries with thousands of collections. "
+        "include_trashed: when True, also show collections in the Zotero "
+        "Trash (annotated as such). Default False, matching Zotero desktop's "
+        "default view. "
+        "Example output:\n"
+        "  - **Orals** (Key: MT53KB66)\n"
+        "    - **Early America** (Key: 3249BZKE)\n"
+        "      - **I. Historiography & Methodology** (Key: XFN79DUT)"
+    )
+)
+@with_zotero_api_lock
+def get_collections(
+    limit: int | str | None = None,
+    include_trashed: bool = False,
+    *,
+    ctx: Context
+) -> str:
+    """
+    List all collections in your Zotero library.
+
+    Args:
+        limit: Maximum number of collections to return
+        include_trashed: if True, merge collections currently in Zotero's
+            Trash into the listing, annotated with ``[trashed]``. Default
+            False matches the Zotero desktop default and the prior
+            behavior of this tool. Trashed collections are normally
+            invisible to automated clients (#233) — turn this on when you
+            need to know they exist.
+        ctx: MCP context
+
+    Returns:
+        Markdown-formatted list of collections
+    """
+    try:
+        ctx.info("Fetching collections")
+        zot = _client.get_zotero_client()
+
+        limit = _helpers._normalize_limit(limit, default=100, max_val=5000)
+
+        collections = _helpers._paginate(zot.collections, max_items=limit)
+        trashed_keys: set[str] = set()
+        if include_trashed:
+            trashed = _helpers.fetch_trashed_collections(zot)
+            existing_keys = {c.get("key") for c in collections}
+            for coll in trashed:
+                key = coll.get("key")
+                if key and key not in existing_keys:
+                    trashed_keys.add(key)
+                    collections.append(coll)
+
+        # Always return the header, even if empty
+        output = ["# Zotero Collections", ""]
+
+        if not collections:
+            output.append("No collections found in your Zotero library.")
+            return "\n".join(output)
+
+        # Create a mapping of collection IDs to their data
+        collection_map = {c["key"]: c for c in collections}
+
+        # Create a mapping of parent to child collections
+        # Only add entries for collections that actually exist
+        hierarchy = {}
+        for coll in collections:
+            parent_key = coll["data"].get("parentCollection")
+            # Handle various representations of "no parent"
+            if parent_key in ["", None] or not parent_key:
+                parent_key = None  # Normalize to None
+
+            if parent_key not in hierarchy:
+                hierarchy[parent_key] = []
+            hierarchy[parent_key].append(coll["key"])
+
+        # Function to recursively format collections
+        def format_collection(key, level=0):
+            if key not in collection_map:
+                return []
+
+            coll = collection_map[key]
+            name = coll["data"].get("name", "Unnamed Collection")
+            trash_marker = " *[trashed]*" if key in trashed_keys else ""
+
+            # Create indentation for hierarchy
+            indent = "  " * level
+            lines = [f"{indent}- **{name}** (Key: {key}){trash_marker}"]
+
+            # Add children if they exist
+            child_keys = hierarchy.get(key, [])
+            for child_key in sorted(child_keys):  # Sort for consistent output
+                lines.extend(format_collection(child_key, level + 1))
+
+            return lines
+
+        # Start with top-level collections (those with None as parent)
+        top_level_keys = hierarchy.get(None, [])
+
+        if not top_level_keys:
+            # If no clear hierarchy, just list all collections
+            output.append("Collections (flat list):")
+            for coll in sorted(collections, key=lambda x: x["data"].get("name", "")):
+                name = coll["data"].get("name", "Unnamed Collection")
+                key = coll["key"]
+                trash_marker = " *[trashed]*" if key in trashed_keys else ""
+                output.append(f"- **{name}** (Key: {key}){trash_marker}")
+        else:
+            # Display hierarchical structure
+            for key in sorted(top_level_keys):
+                output.extend(format_collection(key))
+
+        return "\n".join(output)
+
+    except Exception as e:
+        ctx.error(f"Error fetching collections: {str(e)}")
+        error_msg = f"Error fetching collections: {str(e)}"
+        return f"# Zotero Collections\n\n{error_msg}"
+
+
+# Item types that are normally children of a parent metadata item.
+_CHILD_ITEM_TYPES = {"attachment", "note", "annotation"}
+
+
+def _is_standalone_attachment(data: dict) -> bool:
+    """True for a file dragged into Zotero with no parent metadata item.
+
+    Such an attachment is itself a top-level item, not a child (#224).
+    """
+    return data.get("itemType") == "attachment" and not data.get("parentItem")
+
+
+def _is_top_level_item(item: dict) -> bool:
+    """Whether an item should be listed as a top-level entry in a collection.
+
+    Keeps real parent items and standalone attachments; excludes children
+    that hang off a parent. Standalone notes are excluded too — they carry
+    no useful title and are out of scope for the collection listing.
+    """
+    data = item.get("data", {})
+    if data.get("itemType", "") not in _CHILD_ITEM_TYPES:
+        return True
+    return _is_standalone_attachment(data)
+
+
+@with_zotero_api_lock
+def _build_attachment_extra(info):
+    """Build extra_fields dict from attachment_info for format_item_result."""
+    if not info:
+        return None
+    parts = []
+    if info.get("has_pdf"):
+        parts.append("PDF")
+    att_count = info.get("attachment_count", 0)
+    if att_count:
+        parts.append(f"{att_count} attachment{'s' if att_count != 1 else ''}")
+    if info.get("has_notes"):
+        parts.append("has notes")
+    return {"Attachments": ", ".join(parts)} if parts else None
+
+
+@mcp.tool(
+    name="zotero_get_collection_items",
+    description="Get all items in a specific Zotero collection. Supports detail='keys_only' (minimal), 'summary' (default, no abstracts), or 'full' (with abstracts). Includes PDF/notes indicators. TIP: To find papers on a specific topic, use zotero_semantic_search instead — it's faster and returns only relevant results."
+)
+@with_zotero_api_lock
+def get_collection_items(
+    collection_key: str,
+    detail: Literal["keys_only", "summary", "full"] = "summary",
+    limit: int | str | None = 50,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Get all items in a specific Zotero collection.
+
+    Args:
+        collection_key: The collection key/ID
+        limit: Maximum number of items to return
+        ctx: MCP context
+
+    Returns:
+        Markdown-formatted list of items in the collection
+    """
+    try:
+        ctx.info(f"Fetching items for collection {collection_key}")
+        zot = _client.get_zotero_client()
+
+        # First get the collection details. Fail fast on lookup error: the
+        # Zotero web API returns library-wide items for invalid or not-yet-
+        # propagated collection keys rather than 404ing, so we must not fall
+        # through to collection_items() when we can't confirm the collection
+        # exists.
+        try:
+            collection = zot.collection(collection_key)
+            collection_name = collection["data"].get("name", "Unnamed Collection")
+        except Exception as e:
+            ctx.error(f"Collection lookup failed for {collection_key}: {e}")
+            return (
+                f"Collection not found or not yet accessible: `{collection_key}`. "
+                f"If you just created this collection, wait a moment and try again."
+            )
+
+        limit = _helpers._normalize_limit(limit, default=50)
+
+        # Fetch all items (includes children mixed in with parents)
+        all_items = _helpers._paginate(zot.collection_items, collection_key)
+        if not all_items:
+            return f"No items found in collection: {collection_name} (Key: {collection_key})"
+
+        # Build attachment/note summary from already-fetched children (zero extra API calls)
+        attachment_info = {}
+        for item in all_items:
+            data = item.get("data", {})
+            item_type = data.get("itemType", "")
+            parent_key = data.get("parentItem", "")
+            if not parent_key:
+                continue
+            if parent_key not in attachment_info:
+                attachment_info[parent_key] = {
+                    "has_pdf": False, "attachment_count": 0, "has_notes": False
+                }
+            if item_type == "attachment":
+                attachment_info[parent_key]["attachment_count"] += 1
+                if data.get("contentType", "") == "application/pdf":
+                    attachment_info[parent_key]["has_pdf"] = True
+            elif item_type == "note":
+                attachment_info[parent_key]["has_notes"] = True
+
+        # Keep top-level items only. Previously this dropped every attachment,
+        # which made standalone PDFs (no parent metadata item) vanish from the
+        # collection entirely (#224); _is_top_level_item now keeps those.
+        parent_items = [item for item in all_items if _is_top_level_item(item)]
+
+        if not parent_items:
+            return f"No items found in collection: {collection_name} (Key: {collection_key})"
+
+        # Apply display limit after filtering
+        if limit and len(parent_items) > limit:
+            display_items = parent_items[:limit]
+            truncated = True
+        else:
+            display_items = parent_items
+            truncated = False
+
+        # Format items as markdown based on detail level
+        output = [f"# Items in Collection: {collection_name} ({len(parent_items)} items)", ""]
+
+        for i, item in enumerate(display_items, 1):
+            key = item.get("key", "")
+            data = item.get("data", {})
+            info = attachment_info.get(key, {})
+            # A standalone attachment is its own PDF — surface the PDF indicator
+            # across all detail levels, just like a parent item's child PDF.
+            if (
+                _is_standalone_attachment(data)
+                and data.get("contentType") == "application/pdf"
+            ):
+                info = {**info, "has_pdf": True}
+
+            if detail == "keys_only":
+                # Standalone attachments have no title — fall back to filename.
+                title = data.get("title") or data.get("filename") or "Untitled"
+                date = data.get("date", "")
+                flags = []
+                if info.get("has_pdf"):
+                    flags.append("PDF")
+                if info.get("has_notes"):
+                    flags.append("Notes")
+                flag_str = f" [{', '.join(flags)}]" if flags else ""
+                output.append(f"- `{key}` | {title} ({date}){flag_str}")
+
+            elif detail == "full":
+                extra = _build_attachment_extra(info)
+                output.extend(_utils.format_item_result(
+                    item, index=i, abstract_len=None, include_tags=True,
+                    extra_fields=extra
+                ))
+
+            else:  # "summary" (default)
+                extra = _build_attachment_extra(info)
+                output.extend(_utils.format_item_result(
+                    item, index=i, abstract_len=0, include_tags=True,
+                    extra_fields=extra
+                ))
+
+        if truncated:
+            output.append(f"\n*Showing {limit} of {len(parent_items)} items. Increase the limit parameter to see more.*")
+
+        result = "\n".join(output)
+        if detail == "full":
+            result = _helpers._prepend_size_warning(
+                result,
+                'Use detail="summary" for a lighter response.'
+            )
+        return result
+
+    except Exception as e:
+        ctx.error(f"Error fetching collection items: {str(e)}")
+        return f"Error fetching collection items: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_get_item_children",
+    description=(
+        "List the child items (attachments, notes, and annotations that are "
+        "direct children of the attachment) of ONE parent Zotero item. "
+        "Use this to find an item's PDF/EPUB attachment key before calling "
+        "zotero_create_annotation, zotero_create_area_annotation, or "
+        "zotero_get_pdf_outline — all of which take an attachment key, NOT "
+        "the parent item key. "
+        "If you need children for several items at once, use "
+        "zotero_get_items_children (one batched API call instead of N). "
+        "item_key: the parent item's 8-character key. "
+        "Returns parent-child structure as markdown: each attachment with "
+        "its content type and filename, each note with its title. "
+        "Scope: active library only. "
+        "Example: zotero_get_item_children(item_key='RTKZQI8E') → its "
+        "PDF attachment key + any notes."
+    )
+)
+@with_zotero_api_lock
+def get_item_children(
+    item_key: str,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Get all child items (attachments, notes) for a specific Zotero item.
+
+    Args:
+        item_key: Zotero item key/ID
+        ctx: MCP context
+
+    Returns:
+        Markdown-formatted list of child items
+    """
+    try:
+        ctx.info(f"Fetching children for item {item_key}")
+        zot = _client.get_zotero_client()
+
+        # First get the parent item details
+        try:
+            parent = zot.item(item_key)
+            parent_title = parent["data"].get("title", "Untitled Item")
+        except Exception:
+            parent_title = f"Item {item_key}"
+
+        # Then get the children
+        children = _helpers._paginate(zot.children, item_key)
+        if not children:
+            return f"No child items found for: {parent_title} (Key: {item_key})"
+
+        # Format children as markdown
+        output = [f"# Child Items for: {parent_title}", ""]
+
+        # Group children by type
+        attachments = []
+        notes = []
+        others = []
+
+        for child in children:
+            data = child.get("data", {})
+            item_type = data.get("itemType", "unknown")
+
+            if item_type == "attachment":
+                attachments.append(child)
+            elif item_type == "note":
+                notes.append(child)
+            else:
+                others.append(child)
+
+        # Format attachments
+        if attachments:
+            output.append("## Attachments")
+            for i, att in enumerate(attachments, 1):
+                data = att.get("data", {})
+                title = data.get("title", "Untitled")
+                key = att.get("key", "")
+                content_type = data.get("contentType", "Unknown")
+                filename = data.get("filename", "")
+
+                output.append(f"{i}. **{title}**")
+                output.append(f"   - Key: {key}")
+                output.append(f"   - Type: {content_type}")
+                if filename:
+                    output.append(f"   - Filename: {filename}")
+                output.append("")
+
+        # Format notes
+        if notes:
+            output.append("## Notes")
+            for i, note in enumerate(notes, 1):
+                data = note.get("data", {})
+                title = data.get("title", "Untitled Note")
+                key = note.get("key", "")
+                note_text = data.get("note", "")
+
+                # Clean up HTML in notes
+                note_text = note_text.replace("<p>", "").replace("</p>", "\n\n")
+                note_text = note_text.replace("<br/>", "\n").replace("<br>", "\n")
+
+                # Limit note length for display
+                if len(note_text) > 500:
+                    note_text = note_text[:500] + "...\n\n(Note truncated)"
+
+                output.append(f"{i}. **{title}**")
+                output.append(f"   - Key: {key}")
+                output.append(f"   - Content:\n```\n{note_text}\n```")
+                output.append("")
+
+        # Format other item types
+        if others:
+            output.append("## Other Items")
+            for i, other in enumerate(others, 1):
+                data = other.get("data", {})
+                title = data.get("title", "Untitled")
+                key = other.get("key", "")
+                item_type = data.get("itemType", "unknown")
+
+                output.append(f"{i}. **{title}**")
+                output.append(f"   - Key: {key}")
+                output.append(f"   - Type: {item_type}")
+                output.append("")
+
+        return "\n".join(output)
+
+    except Exception as e:
+        ctx.error(f"Error fetching item children: {str(e)}")
+        return f"Error fetching item children: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_get_items_children",
+    description=(
+        "Batch variant of zotero_get_item_children: fetch child items "
+        "(attachments, notes, annotations) for MULTIPLE parent items in a "
+        "single API round trip. "
+        "Much cheaper than calling zotero_get_item_children N times — use "
+        "this whenever you have 2+ item keys in hand. "
+        "item_keys: list of 8-character parent item keys (also accepts a "
+        "JSON-encoded list string). Pass as an ARRAY, not a single "
+        "concatenated string. "
+        "Returns a markdown section per parent with its children grouped "
+        "underneath. Missing keys are reported per-item rather than "
+        "aborting the whole call. "
+        "Scope: active library only. "
+        "Example: zotero_get_items_children("
+        "item_keys=['RTKZQI8E', '9UZR8GXT'])."
+    )
+)
+@with_zotero_api_lock
+def get_items_children(
+    item_keys: list[str] | str,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Get child items for multiple Zotero items in a single call.
+
+    Args:
+        item_keys: List of item keys (or JSON string, or comma-separated string)
+        ctx: MCP context
+    """
+    try:
+        zot = _client.get_zotero_client()
+        keys = _helpers._normalize_str_list_input(item_keys, "item_keys")
+
+        if not keys:
+            return "Error: No item keys provided."
+
+        # Batch-resolve parent titles (50 per API call)
+        parent_titles = {}
+        for batch_start in range(0, len(keys), 50):
+            batch = keys[batch_start:batch_start + 50]
+            try:
+                items = zot.items(itemKey=",".join(batch))
+                for item in items:
+                    k = item.get("key", "")
+                    parent_titles[k] = item.get("data", {}).get("title", "Untitled")
+            except Exception as e:
+                ctx.warning(f"Batch parent lookup failed: {e}")
+                for k in batch:
+                    parent_titles.setdefault(k, f"(key: {k})")
+
+        output = [f"# Children for {len(keys)} items", ""]
+
+        for key in keys:
+            title = parent_titles.get(key, f"(key: {key})")
+            output.append(f"## {title} (`{key}`)")
+
+            try:
+                children = _helpers._paginate(zot.children, key)
+            except Exception as e:
+                output.append(f"  Error fetching children: {e}")
+                output.append("")
+                continue
+
+            if not children:
+                output.append("  No child items.")
+                output.append("")
+                continue
+
+            for child in children:
+                data = child.get("data", {})
+                child_type = data.get("itemType", "unknown")
+                child_key = child.get("key", "")
+
+                if child_type == "attachment":
+                    ct = data.get("contentType", "")
+                    fn = data.get("filename", "")
+                    link = data.get("linkMode", "")
+                    output.append(f"  - [{child_key}] Attachment: {fn or '(no filename)'} ({ct}) [{link}]")
+
+                elif child_type == "note":
+                    note_text = _utils.clean_html(data.get("note", ""))[:150]
+                    output.append(f"  - [{child_key}] Note: {note_text}...")
+
+                elif child_type == "annotation":
+                    ann_text = data.get("annotationText", "")[:100]
+                    ann_type = data.get("annotationType", "")
+                    output.append(f"  - [{child_key}] {ann_type}: {ann_text}...")
+
+                else:
+                    output.append(f"  - [{child_key}] {child_type}: {data.get('title', '')}")
+
+            output.append("")
+
+        return "\n".join(output)
+
+    except ValueError as e:
+        return f"Input error: {e}"
+    except Exception as e:
+        ctx.error(f"Error fetching items children: {str(e)}")
+        return f"Error fetching items children: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_get_tags",
+    description=(
+        "List all tags used in the currently active Zotero library, as a "
+        "flat markdown list (one tag per line). "
+        "Use this for tag discovery before filtering with "
+        "zotero_search_by_tag or batch-editing with zotero_batch_update_tags. "
+        "Scope is the active library only — switch with "
+        "zotero_switch_library before listing. The list is flat: tags have "
+        "no parent/child structure in Zotero, only a colon convention "
+        "(\"area/subtag\") that this tool preserves verbatim. "
+        "limit: cap on tags returned; None (default) returns all. "
+        "Example output:\n"
+        "  - to-read\n"
+        "  - methods/qualitative\n"
+        "  - AI agents"
+    )
+)
+@with_zotero_api_lock
+def get_tags(
+    limit: int | str | None = None,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Get all tags used in your Zotero library.
+
+    Args:
+        limit: Maximum number of tags to return
+        ctx: MCP context
+
+    Returns:
+        Markdown-formatted list of tags
+    """
+    try:
+        ctx.info("Fetching tags")
+        zot = _client.get_zotero_client()
+
+        limit = _helpers._normalize_limit(limit, default=500, max_val=5000)
+
+        # Use _paginate instead of zot.everything() to avoid RLock pickling
+        tags = _helpers._paginate(zot.tags)
+        if not tags:
+            return "No tags found in your Zotero library."
+
+        # Format tags as markdown
+        total_count = len(tags)
+        output = [f"# Zotero Tags ({total_count} total)", ""]
+
+        # Sort tags alphabetically
+        sorted_tags = sorted(tags)
+
+        # Apply display limit
+        truncated = False
+        if limit and len(sorted_tags) > limit:
+            sorted_tags = sorted_tags[:limit]
+            truncated = True
+
+        # Group tags alphabetically
+        current_letter = None
+        for tag in sorted_tags:
+            first_letter = tag[0].upper() if tag else "#"
+
+            if first_letter != current_letter:
+                current_letter = first_letter
+                output.append(f"## {current_letter}")
+
+            output.append(f"- `{tag}`")
+
+        if truncated:
+            output.append(f"\n*Showing {limit} of {total_count} tags. Increase the limit parameter to see more.*")
+
+        return "\n".join(output)
+
+    except Exception as e:
+        ctx.error(f"Error fetching tags: {str(e)}")
+        return f"Error fetching tags: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_list_libraries",
+    description=(
+        "List every Zotero library this MCP can address: the user's "
+        "personal library (libraryID=1 conventionally), all group "
+        "libraries the user is a member of (with groupID), and (in "
+        "local mode) RSS feed libraries. Each entry shows the "
+        "library/group ID, display name, and item count. "
+        "Use this to discover a library ID before calling "
+        "zotero_switch_library — the two form a read-then-switch "
+        "workflow. If the user only wants to see Zotero collections "
+        "inside the CURRENT library, use zotero_get_collections "
+        "instead. "
+        "No parameters. "
+        "In local mode: reads the local Zotero SQLite DB (fast, includes "
+        "RSS feeds). In web mode: queries /groups via the Zotero web "
+        "API (no feeds). "
+        "Read-only; no side effects. The active library isn't flagged "
+        "in the output — track it yourself from the last successful "
+        "zotero_switch_library call (or the ZOTERO_LIBRARY_ID env var "
+        "if none). "
+        "Example: zotero_list_libraries()."
+    ),
+)
+@with_zotero_api_lock
+def list_libraries(*, ctx: Context) -> str:
+    """
+    List all accessible Zotero libraries.
+
+    In local mode, reads directly from the SQLite database.
+    In web mode, queries groups via the Zotero API.
+
+    Returns:
+        Markdown-formatted list of libraries with item counts.
+    """
+    try:
+        ctx.info("Listing accessible libraries")
+        local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
+        override = _client.get_active_library()
+
+        output = ["# Zotero Libraries", ""]
+
+        # Show active library context
+        if override:
+            output.append(
+                f"> **Active library:** ID={override['library_id']}, "
+                f"type={override['library_type']}"
+            )
+            output.append("")
+
+        if local:
+            from zotero_mcp.local_db import LocalZoteroReader
+
+            reader = LocalZoteroReader(db_path=load_config().resolve_zotero_db_path())
+            try:
+                libraries = reader.get_libraries()
+
+                # User library
+                user_libs = [library for library in libraries if library["type"] == "user"]
+                if user_libs:
+                    output.append("## User Library")
+                    for lib in user_libs:
+                        output.append(
+                            f"- **My Library** — {lib['itemCount']} items "
+                            f"(libraryID={lib['libraryID']})"
+                        )
+                    output.append("")
+
+                # Group libraries
+                group_libs = [library for library in libraries if library["type"] == "group"]
+                if group_libs:
+                    output.append("## Group Libraries")
+                    for lib in group_libs:
+                        desc = f" — {lib['groupDescription']}" if lib.get("groupDescription") else ""
+                        output.append(
+                            f"- **{lib['groupName']}** — {lib['itemCount']} items "
+                            f"(groupID={lib['groupID']}){desc}"
+                        )
+                    output.append("")
+
+                # Feeds
+                feed_libs = [library for library in libraries if library["type"] == "feed"]
+                if feed_libs:
+                    output.append("## RSS Feeds")
+                    for lib in feed_libs:
+                        output.append(
+                            f"- **{lib['feedName']}** — {lib['itemCount']} items "
+                            f"(libraryID={lib['libraryID']})"
+                        )
+                    output.append("")
+            finally:
+                reader.close()
+        else:
+            # Web mode: query groups via pyzotero
+            zot = _client.get_zotero_client()
+            output.append("## User Library")
+            output.append(
+                f"- **My Library** (libraryID={os.getenv('ZOTERO_LIBRARY_ID', '?')})"
+            )
+            output.append("")
+
+            try:
+                groups = zot.groups()
+                if groups:
+                    output.append("## Group Libraries")
+                    for group in groups:
+                        gdata = group.get("data", {})
+                        output.append(
+                            f"- **{gdata.get('name', 'Unknown')}** "
+                            f"(groupID={group.get('id', '?')})"
+                        )
+                    output.append("")
+            except Exception:
+                output.append("*Could not retrieve group libraries.*\n")
+
+            output.append("*Note: RSS feeds are only accessible in local mode.*")
+
+        output.append("")
+        output.append(
+            "Use `zotero_switch_library` to switch to a different library."
+        )
+
+        return "\n".join(output)
+
+    except Exception as e:
+        ctx.error(f"Error listing libraries: {str(e)}")
+        return f"Error listing libraries: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_switch_library",
+    description=(
+        "Switch the active library context. EVERY subsequent read/write "
+        "tool call (collections, items, annotations, search — all of "
+        "them) operates on the library set here. Changes persist for the "
+        "rest of the session or until the next switch. "
+        "Discover valid library IDs/types via zotero_list_libraries "
+        "first; don't guess. "
+        "library_id: library ID string as returned by "
+        "zotero_list_libraries (numeric for user/group, numeric for "
+        "feeds). "
+        "library_type: 'user' — the personal library; 'group' (default) "
+        "— a group library; 'feeds' — a local RSS feed library; "
+        "'default' — RESET to whatever the ZOTERO_LIBRARY_ID / "
+        "ZOTERO_LIBRARY_TYPE env vars configure (library_id is ignored "
+        "in this mode). "
+        "Fails fast if the library_id isn't accessible under the "
+        "current credentials. "
+        "Example: zotero_switch_library(library_id='5294983', "
+        "library_type='group') or zotero_switch_library("
+        "library_id='', library_type='default')."
+    ),
+)
+@with_zotero_api_lock
+def switch_library(
+    library_id: str,
+    library_type: str = "group",
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Switch the active library for all subsequent MCP tool calls.
+
+    Args:
+        library_id: The library/group ID to switch to.
+            For user library: "0" (local mode) or your user ID (web mode).
+            For group libraries: the groupID (e.g. "6069773").
+        library_type: "user", "group", or "default" to reset to env var defaults.
+        ctx: MCP context
+
+    Returns:
+        Confirmation message with active library details.
+    """
+    try:
+        # TODO(human): Implement validate_library_switch() below
+        if library_type == "default":
+            _client.clear_active_library()
+            ctx.info("Reset to default library configuration")
+            return (
+                "Switched back to default library configuration "
+                f"(ZOTERO_LIBRARY_ID={os.getenv('ZOTERO_LIBRARY_ID', '0')}, "
+                f"ZOTERO_LIBRARY_TYPE={os.getenv('ZOTERO_LIBRARY_TYPE', 'user')})"
+            )
+
+        error = validate_library_switch(library_id, library_type)
+        if error:
+            return error
+
+        _client.set_active_library(library_id, library_type)
+        ctx.info(f"Switched to library {library_id} (type={library_type})")
+
+        # Verify the switch works by making a test call
+        try:
+            zot = _client.get_zotero_client()
+            zot.add_parameters(limit=1)
+            zot.items()
+            return (
+                f"Successfully switched to library **{library_id}** "
+                f"(type={library_type}). All tools now operate on this library."
+            )
+        except Exception as e:
+            # Roll back on failure
+            _client.clear_active_library()
+            return (
+                f"Error: Could not access library {library_id} "
+                f"(type={library_type}): {e}. Reverted to default library."
+            )
+
+    except Exception as e:
+        ctx.error(f"Error switching library: {str(e)}")
+        return f"Error switching library: {str(e)}"
+
+
+@with_zotero_api_lock
+def validate_library_switch(library_id: str, library_type: str) -> str | None:
+    """Validate a library switch request before applying it.
+
+    Returns an error message string if the switch should be rejected,
+    or None if the switch is valid and should proceed.
+    """
+    if library_type not in ("user", "group", "feed"):
+        return f"Invalid library_type '{library_type}'. Must be 'user', 'group', or 'feed'."
+
+    # In local mode, verify the library actually exists in the database
+    local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
+    if local:
+        try:
+            from zotero_mcp.local_db import LocalZoteroReader
+
+            reader = LocalZoteroReader(db_path=load_config().resolve_zotero_db_path())
+            try:
+                libraries = reader.get_libraries()
+                if library_type == "group":
+                    valid_ids = {str(library["groupID"]) for library in libraries if library["type"] == "group"}
+                    if library_id not in valid_ids:
+                        return (
+                            f"Group '{library_id}' not found. "
+                            f"Available groups: {', '.join(sorted(valid_ids))}"
+                        )
+                elif library_type == "feed":
+                    valid_ids = {str(library["libraryID"]) for library in libraries if library["type"] == "feed"}
+                    if library_id not in valid_ids:
+                        return (
+                            f"Feed with libraryID '{library_id}' not found. "
+                            f"Available feeds: {', '.join(sorted(valid_ids))}"
+                        )
+            finally:
+                reader.close()
+        except Exception:
+            pass  # If DB unavailable, skip validation — the test call will catch it
+
+    return None
+
+
+@mcp.tool(
+    name="zotero_list_feeds",
+    description=(
+        "List all RSS feed subscriptions configured in the local Zotero "
+        "desktop install. Each entry includes the feed's library ID, "
+        "display name, source URL, item count, and last-checked "
+        "timestamp. "
+        "Use this to discover a feed's library_id before calling "
+        "zotero_get_feed_items; the two form a list-then-fetch workflow "
+        "analogous to list_libraries + switch_library. "
+        "No parameters. "
+        "LOCAL MODE ONLY — RSS feeds live in the local SQLite database "
+        "and are not exposed by the Zotero web API. Running this in web "
+        "mode returns a clear error. Read-only; no side effects. "
+        "Example: zotero_list_feeds() → all subscribed feeds."
+    ),
+)
+@with_zotero_api_lock
+def list_feeds(*, ctx: Context) -> str:
+    """
+    List all RSS feed subscriptions from the local Zotero database.
+
+    Returns:
+        Markdown-formatted list of RSS feeds.
+    """
+    try:
+        local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
+        if not local:
+            return "RSS feeds are only accessible in local mode (ZOTERO_LOCAL=true)."
+
+        ctx.info("Listing RSS feeds")
+        from zotero_mcp.local_db import LocalZoteroReader
+
+        reader = LocalZoteroReader(db_path=load_config().resolve_zotero_db_path())
+        try:
+            feeds = reader.get_feeds()
+            if not feeds:
+                return "No RSS feeds found in your Zotero installation."
+
+            output = ["# RSS Feeds", ""]
+            for feed in feeds:
+                last_check = feed["lastCheck"] or "never"
+                error = f" (error: {feed['lastCheckError']})" if feed.get("lastCheckError") else ""
+                output.append(f"### {feed['name']}")
+                output.append(f"- **URL:** {feed['url']}")
+                output.append(f"- **Items:** {feed['itemCount']}")
+                output.append(f"- **Last checked:** {last_check}{error}")
+                output.append(f"- **Library ID:** {feed['libraryID']}")
+                output.append("")
+
+            output.append(
+                "Use `zotero_get_feed_items` with a feed's library ID to view its items."
+            )
+            return "\n".join(output)
+        finally:
+            reader.close()
+
+    except Exception as e:
+        ctx.error(f"Error listing feeds: {str(e)}")
+        return f"Error listing feeds: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_get_feed_items",
+    description=(
+        "Fetch recent items from a SPECIFIC Zotero RSS feed by its local "
+        "library ID. Returns titles, authors, dates, and URLs as a "
+        "markdown list. "
+        "Find the right library_id first with zotero_list_feeds — "
+        "guessing feed IDs never works. "
+        "library_id: INTEGER library ID of the feed (as shown by "
+        "zotero_list_feeds, NOT the feed's name or URL). "
+        "limit: max feed items to return (default 20). "
+        "LOCAL MODE ONLY — feeds aren't exposed by the Zotero web API. "
+        "Calls in web mode return a clear error. Read-only; does not "
+        "trigger a new RSS fetch (Zotero desktop refreshes on its own "
+        "schedule). "
+        "Example: zotero_get_feed_items(library_id=12, limit=30)."
+    ),
+)
+@with_zotero_api_lock
+def get_feed_items(
+    library_id: int,
+    limit: int = 20,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Retrieve items from a specific RSS feed.
+
+    Args:
+        library_id: The libraryID of the feed (from zotero_list_feeds).
+        limit: Maximum number of items to return.
+        ctx: MCP context
+
+    Returns:
+        Markdown-formatted list of feed items.
+    """
+    try:
+        local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
+        if not local:
+            return "RSS feed items are only accessible in local mode (ZOTERO_LOCAL=true)."
+
+        ctx.info(f"Fetching items from feed (libraryID={library_id})")
+        from zotero_mcp.local_db import LocalZoteroReader
+
+        reader = LocalZoteroReader(db_path=load_config().resolve_zotero_db_path())
+        try:
+            # Verify this is actually a feed
+            feeds = reader.get_feeds()
+            feed_info = next((f for f in feeds if f["libraryID"] == library_id), None)
+            if not feed_info:
+                valid_ids = [str(f["libraryID"]) for f in feeds]
+                return (
+                    f"No feed found with libraryID={library_id}. "
+                    f"Valid feed IDs: {', '.join(valid_ids)}"
+                )
+
+            items = reader.get_feed_items(library_id, limit=limit)
+            if not items:
+                return f"No items found in feed '{feed_info['name']}'."
+
+            output = [f"# Feed: {feed_info['name']}", f"**URL:** {feed_info['url']}", ""]
+
+            for item in items:
+                read_status = "Read" if item.get("readTime") else "Unread"
+                title = item.get("title") or "Untitled"
+                output.append(f"### {title}")
+                output.append(f"- **Status:** {read_status}")
+                if item.get("creators"):
+                    output.append(f"- **Authors:** {item['creators']}")
+                if item.get("url"):
+                    output.append(f"- **URL:** {item['url']}")
+                if item.get("date"):
+                    output.append(f"- **Date:** {item['date']}")
+                if item.get("DOI"):
+                    output.append(f"- **DOI:** {item['DOI']}")
+                output.append(f"- **Added:** {item.get('dateAdded', 'unknown')}")
+                if item.get("abstract"):
+                    abstract = _utils.clean_html(item["abstract"])
+                    if len(abstract) > 200:
+                        abstract = abstract[:200] + "..."
+                    output.append(f"- **Abstract:** {abstract}")
+                output.append("")
+
+            return "\n".join(output)
+        finally:
+            reader.close()
+
+    except Exception as e:
+        ctx.error(f"Error fetching feed items: {str(e)}")
+        return f"Error fetching feed items: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_get_recent",
+    description=(
+        "List the most recently ADDED items (by dateAdded) in the active "
+        "library, optionally scoped to a single collection. "
+        "Use this for 'what did I add recently?' questions — NOT for "
+        "general topic search (use zotero_semantic_search) or for a "
+        "collection's full contents (use zotero_get_collection_items). "
+        "limit: how many recent items to return (default 10). "
+        "collection_key: optional 8-character collection key to restrict "
+        "results to that collection; when omitted, returns the N most "
+        "recent items across the whole library. "
+        "Ordering is dateAdded DESC. All item types are returned, "
+        "INCLUDING standalone notes and attachments — so results can mix "
+        "papers, notes, and loose PDFs. If you only want parent items, "
+        "filter client-side by itemType in the output. "
+        "Scope: active library only (switch with zotero_switch_library). "
+        "Example: zotero_get_recent(limit=20) or "
+        "zotero_get_recent(collection_key='MT53KB66', limit=5)."
+    )
+)
+@with_zotero_api_lock
+def get_recent(
+    limit: int | str = 10,
+    collection_key: str | None = None,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Get recently added items to your Zotero library.
+
+    Args:
+        limit: Number of items to return
+        collection_key: Optional collection key to scope results to a specific collection
+        ctx: MCP context
+
+    Returns:
+        Markdown-formatted list of recent items
+    """
+    try:
+        ctx.info(f"Fetching {limit} recent items")
+        zot = _client.get_zotero_client()
+
+        limit = _helpers._normalize_limit(limit, default=10)
+
+        # Get recent items, optionally scoped to a collection
+        if collection_key:
+            try:
+                _col = zot.collection(collection_key)
+            except Exception:
+                _col = None
+            if not _col or _col.get("key") != collection_key:
+                return f"Collection not found: '{collection_key}'. Use zotero_get_collections or zotero_search_collections to find valid collection keys."
+            items = zot.collection_items(collection_key, sort="dateAdded", direction="desc", limit=limit)
+        else:
+            items = zot.items(limit=limit, sort="dateAdded", direction="desc")
+
+        if not items:
+            return "No items found in your Zotero library." if not collection_key else f"No items found in collection: {collection_key}"
+
+        # Format items as markdown
+        scope = f" in Collection {collection_key}" if collection_key else ""
+        output = [f"# {limit} Most Recently Added Items{scope}", ""]
+
+        for i, item in enumerate(items, 1):
+            added = item.get("data", {}).get("dateAdded", "Unknown")
+            output.extend(_utils.format_item_result(
+                item, index=i, abstract_len=0, include_tags=False,
+                extra_fields={"Added": added},
+            ))
+
+        return "\n".join(output)
+
+    except Exception as e:
+        ctx.error(f"Error fetching recent items: {str(e)}")
+        return f"Error fetching recent items: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_get_item_related",
+    description="Get all related items for a specific Zotero item. Returns items that are linked via the relations field."
+)
+def get_item_related(
+    item_key: str,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Get all related items for a specific Zotero item.
+
+    Args:
+        item_key: Zotero item key/ID
+        ctx: MCP context
+
+    Returns:
+        Markdown-formatted list of related items
+    """
+    try:
+        ctx.info(f"Fetching related items for {item_key}")
+        zot = _client.get_zotero_client()
+
+        # Fetch the item
+        try:
+            item = zot.item(item_key)
+        except Exception:
+            return f"Error: Item '{item_key}' not found."
+
+        data = item.get("data", {})
+        item_title = data.get("title", "Untitled")
+        relations = data.get("relations", {})
+
+        if not isinstance(relations, dict) or not relations:
+            return f"No related items found for: **{item_title}** (Key: `{item_key}`)"
+
+        # Extract related item keys from URIs
+        # Zotero uses URIs like: http://zotero.org/users/{library_id}/items/{item_key}
+        # or http://zotero.org/groups/{group_id}/items/{item_key}
+
+        related_keys = []
+        seen_keys = set()
+        for rel_type, rel_values in relations.items():
+            if not isinstance(rel_values, list):
+                rel_values = [rel_values]
+            for uri in rel_values:
+                if not isinstance(uri, str):
+                    continue
+                # Extract item key from URI
+                match = re.search(r'/items/([A-Z0-9]{8})$', uri)
+                if match:
+                    key = match.group(1)
+                    # Deduplicate: same key may appear with both users/ and groups/ prefix
+                    dedup_id = (rel_type, key)
+                    if dedup_id not in seen_keys:
+                        seen_keys.add(dedup_id)
+                        related_keys.append((rel_type, key, uri))
+
+        if not related_keys:
+            return f"No related items found for: **{item_title}** (Key: `{item_key}`)"
+
+        # Fetch details for related items
+        output = [f"# Related Items for: {item_title}", f"**Item Key:** `{item_key}`", ""]
+
+        # Group by relation type
+        by_type = {}
+        for rel_type, key, uri in related_keys:
+            if rel_type not in by_type:
+                by_type[rel_type] = []
+            by_type[rel_type].append((key, uri))
+
+        for rel_type, items in by_type.items():
+            output.append(f"## Relation Type: `{rel_type}`")
+            output.append("")
+
+            for rel_key, uri in items:
+                try:
+                    rel_item = zot.item(rel_key)
+                    rel_data = rel_item.get("data", {})
+                    rel_title = rel_data.get("title", "Untitled")
+                    rel_type_name = rel_data.get("itemType", "unknown")
+                    rel_date = rel_data.get("date", "")
+                    rel_creator = ""
+                    if rel_data.get("creators"):
+                        first_creator = rel_data["creators"][0]
+                        if "lastName" in first_creator:
+                            rel_creator = first_creator["lastName"]
+                        elif "name" in first_creator:
+                            rel_creator = first_creator["name"]
+
+                    creator_info = f", {rel_creator}" if rel_creator else ""
+                    date_info = f" ({rel_date})" if rel_date else ""
+
+                    output.append(f"- `{rel_key}` — **{rel_title}**{creator_info}{date_info}")
+                    output.append(f"  - Type: {rel_type_name}")
+                    if doi := rel_data.get("DOI"):
+                        output.append(f"  - DOI: {doi}")
+                    output.append("")
+                except Exception as e:
+                    output.append(f"- `{rel_key}` — (Could not fetch details: {e})")
+                    output.append("")
+
+        return "\n".join(output)
+
+    except Exception as e:
+        ctx.error(f"Error fetching related items: {str(e)}")
+        return f"Error fetching related items: {str(e)}"
