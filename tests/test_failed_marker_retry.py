@@ -32,6 +32,8 @@ class FakeItem:
         self.doi = None
         self.notes = None
         self.creators = None
+        # Publication date, already reduced to the user string the API returns
+        self.date = "2015"
         self.date_added = "2026-07-01 00:00:00"
         self.date_modified = DATE_MODIFIED
         self.fulltext = None
