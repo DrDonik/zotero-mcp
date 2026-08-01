@@ -439,6 +439,10 @@ class ZoteroSemanticSearch:
         # indexing and existing collections byte-for-byte).
         self._chunking_config = self._load_chunking_config()
 
+        # Lazily-opened local reader used to enrich search hits that the
+        # single-library API client cannot resolve (see _local_item_fallback).
+        self._fallback_reader: LocalZoteroReader | None = None
+
     def _load_chunking_config(self) -> dict[str, Any]:
         """Load passage-chunking configuration from file or use defaults.
 
@@ -1294,6 +1298,10 @@ class ZoteroSemanticSearch:
                             "title": item.title or "",
                             "abstractNote": item.abstract or "",
                             "extra": item.extra or "",
+                            # Publication date. Without this every locally
+                            # indexed item carried an empty ``date`` into
+                            # ChromaDB metadata and rendered as "No date".
+                            "date": item.date or "",
                             # Include fulltext only when extracted
                             "fulltext": getattr(item, "fulltext", None) or "" if extract_fulltext else "",
                             "fulltextSource": getattr(item, "fulltext_source", None) or "" if extract_fulltext else "",
@@ -2481,6 +2489,58 @@ class ZoteroSemanticSearch:
                 "error": str(e),
             }
 
+    def _local_item_fallback(self, item_key: str) -> dict[str, Any] | None:
+        """Resolve an item from the local Zotero database when the API cannot.
+
+        ``self.zotero_client`` is scoped to a single library, so a search hit
+        from any *other* indexed library 404s during enrichment — #163 phase 1
+        added cross-library indexing and filtering but left cross-library
+        enrichment to a follow-up. The local SQLite database carries no such
+        scope: it holds every library the user has. In local mode a failed
+        lookup is therefore retried there instead of degrading the hit to a
+        bare item key, which is unusable as a citation.
+
+        Returns an API-shaped item dict (the same shape the local indexing
+        path builds), or ``None`` when local mode is off, the database is
+        unreachable, or the key genuinely does not exist.
+        """
+        if not is_local_mode():
+            return None
+
+        try:
+            if self._fallback_reader is None:
+                zotero_db_path = self.db_path
+                if not zotero_db_path and self.config_path and os.path.exists(self.config_path):
+                    with open(self.config_path) as f:
+                        zotero_db_path = (
+                            json.load(f).get("semantic_search", {}).get("zotero_db_path")
+                        )
+                self._fallback_reader = LocalZoteroReader(db_path=zotero_db_path)
+            item = self._fallback_reader.get_item_by_key(item_key)
+        except Exception as e:
+            logger.debug(f"Local enrichment fallback failed for {item_key}: {e}")
+            return None
+
+        if item is None:
+            return None
+
+        return {
+            "key": item.key,
+            "version": 0,
+            "data": {
+                "key": item.key,
+                "itemType": item.item_type or "document",
+                "title": item.title or "",
+                "date": item.date or "",
+                "abstractNote": item.abstract or "",
+                "extra": item.extra or "",
+                "DOI": item.doi or "",
+                "creators": self._parse_creators_string(item.creators) if item.creators else [],
+                "dateAdded": item.date_added,
+                "dateModified": item.date_modified,
+            },
+        }
+
     def _enrich_search_results(
         self, chroma_results: dict[str, Any], query: str, limit: int | None = None
     ) -> list[dict[str, Any]]:
@@ -2536,8 +2596,15 @@ class ZoteroSemanticSearch:
             try:
                 enriched_result["zotero_item"] = self.zotero_client.item(item_key)
             except Exception as e:
-                logger.error(f"Error enriching result for item {item_key}: {e}")
-                enriched_result["error"] = f"Could not fetch full item data: {e}"
+                # The hit may simply live in another library than the active
+                # one; the local database sees them all.
+                local_item = self._local_item_fallback(item_key)
+                if local_item is not None:
+                    enriched_result["zotero_item"] = local_item
+                    enriched_result["enrichment_source"] = "local-db"
+                else:
+                    logger.error(f"Error enriching result for item {item_key}: {e}")
+                    enriched_result["error"] = f"Could not fetch full item data: {e}"
 
             enriched.append(enriched_result)
             if limit and len(enriched) >= limit:

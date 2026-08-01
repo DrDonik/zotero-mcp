@@ -124,6 +124,21 @@ def _data_dirs_from_profiles() -> list[Path]:
     return data_dirs
 
 
+def _normalize_zotero_date(raw: str | None) -> str | None:
+    """Reduce Zotero's stored multipart date to the part the API returns.
+
+    ``itemData`` keeps dates as ``"<sql-date> <user string>"`` — e.g.
+    ``"2015-00-00 2015"`` or ``"2015-03-17 March 17, 2015"`` — where unknown
+    components are zero-filled. The web API exposes only the user string, so
+    normalizing here keeps locally-read items indistinguishable from
+    API-read ones downstream.
+    """
+    if not raw:
+        return raw
+    head, sep, tail = raw.partition(" ")
+    return (tail.strip() or head) if sep else head
+
+
 @dataclass
 class ZoteroItem:
     """Represents a Zotero item with text content for semantic search."""
@@ -135,6 +150,7 @@ class ZoteroItem:
     title: str | None = None
     abstract: str | None = None
     creators: str | None = None
+    date: str | None = None
     fulltext: str | None = None
     fulltext_source: str | None = None  # 'pdf' or 'html'
     notes: str | None = None
@@ -715,7 +731,7 @@ class LocalZoteroReader:
                    url_val.value as url,
                    GROUP_CONCAT(
                        CASE
-                           WHEN c.firstName IS NOT NULL AND c.lastName IS NOT NULL
+                           WHEN NULLIF(c.firstName, '') IS NOT NULL AND c.lastName IS NOT NULL
                            THEN c.lastName || ', ' || c.firstName
                            WHEN c.lastName IS NOT NULL THEN c.lastName
                            ELSE NULL
@@ -847,10 +863,11 @@ class LocalZoteroReader:
             abstract_val.value as abstract,
             extra_val.value as extra,
             doi_val.value as doi,
+            date_val.value as date,
             GROUP_CONCAT(n.note, ' ') as notes,
             GROUP_CONCAT(
                 CASE
-                    WHEN c.firstName IS NOT NULL AND c.lastName IS NOT NULL
+                    WHEN NULLIF(c.firstName, '') IS NOT NULL AND c.lastName IS NOT NULL
                     THEN c.lastName || ', ' || c.firstName
                     WHEN c.lastName IS NOT NULL
                     THEN c.lastName
@@ -876,6 +893,11 @@ class LocalZoteroReader:
         LEFT JOIN fields doi_f ON doi_f.fieldName = 'DOI'
         LEFT JOIN itemData doi_data ON i.itemID = doi_data.itemID AND doi_data.fieldID = doi_f.fieldID
         LEFT JOIN itemDataValues doi_val ON doi_data.valueID = doi_val.valueID
+
+        -- Get publication date via fields table
+        LEFT JOIN fields date_f ON date_f.fieldName = 'date'
+        LEFT JOIN itemData date_data ON i.itemID = date_data.itemID AND date_data.fieldID = date_f.fieldID
+        LEFT JOIN itemDataValues date_val ON date_data.valueID = date_val.valueID
 
         -- Get notes
         LEFT JOIN itemNotes n ON i.itemID = n.parentItemID OR i.itemID = n.itemID
@@ -935,6 +957,7 @@ class LocalZoteroReader:
                 title=row['title'],
                 abstract=row['abstract'],
                 creators=row['creators'],
+                date=_normalize_zotero_date(row['date']),
                 fulltext=(res := (self._extract_fulltext_for_item(row['itemID']) if include_fulltext else None)) and res[0],
                 fulltext_source=res[1] if include_fulltext and res else None,
                 notes=row['notes'],
