@@ -83,5 +83,33 @@ async def server_lifespan(server: FastMCP):
     sys.stderr.write("Shutting down Zotero MCP server...\n")
 
 
+class _ZoteroMCP(FastMCP):
+    """FastMCP whose ``@tool`` decorator leaves the plain function in place.
+
+    fastmcp 2.x replaces the decorated function with a ``FunctionTool``
+    wrapper object; 3.x hands back the undecorated function. We depend on
+    the 3.x behaviour in several places that call tools as ordinary Python
+    functions — :mod:`zotero_mcp.cli_standalone`,
+    :func:`zotero_mcp.tools.connectors.connector_fetch` (which calls
+    ``get_item_fulltext``), and the test suite. Since pyproject allows
+    ``fastmcp>=2.14.0``, normalise on returning the function. Registration
+    with the app happens either way.
+    """
+
+    def tool(self, name_or_fn=None, **kwargs):
+        registered = super().tool(name_or_fn, **kwargs)
+
+        if callable(name_or_fn):
+            # Used bare as ``@mcp.tool`` — already registered.
+            return getattr(registered, "fn", registered)
+
+        # Used as ``@mcp.tool(...)`` — ``registered`` is the real decorator.
+        def decorator(fn):
+            tool = registered(fn)
+            return getattr(tool, "fn", tool)
+
+        return decorator
+
+
 # Create an MCP server (fastmcp 2.14+ no longer accepts `dependencies`)
-mcp = FastMCP("Zotero", lifespan=server_lifespan)
+mcp = _ZoteroMCP("Zotero", lifespan=server_lifespan)
