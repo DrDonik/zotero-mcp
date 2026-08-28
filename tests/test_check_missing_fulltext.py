@@ -146,3 +146,45 @@ def test_zotero_db_is_opened_immutable(monkeypatch):
 
     assert "immutable=1" in seen["dsn"]
     assert "mode=ro" not in seen["dsn"]
+
+
+def _fixture_zotero_db(path, trashed_keys=()):
+    """A minimal zotero.sqlite holding two PDF-owning items."""
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE itemTypes (itemTypeID INTEGER PRIMARY KEY, typeName TEXT);
+        CREATE TABLE items (itemID INTEGER PRIMARY KEY, key TEXT, itemTypeID INTEGER);
+        CREATE TABLE itemData (itemID INTEGER, fieldID INTEGER, valueID INTEGER);
+        CREATE TABLE itemDataValues (valueID INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE itemCreators (itemID INTEGER, creatorID INTEGER, orderIndex INTEGER);
+        CREATE TABLE creators (creatorID INTEGER PRIMARY KEY, firstName TEXT, lastName TEXT);
+        CREATE TABLE itemAttachments (itemID INTEGER, parentItemID INTEGER, contentType TEXT);
+        CREATE TABLE deletedItems (itemID INTEGER PRIMARY KEY);
+        INSERT INTO itemTypes VALUES (1, 'journalArticle'), (2, 'attachment');
+    """)
+    for i, key in enumerate(("KEEPME01", "TRASHED1"), start=1):
+        conn.execute("INSERT INTO items VALUES (?,?,1)", (i, key))
+        conn.execute("INSERT INTO itemDataValues VALUES (?,?)", (i, f"Title {key}"))
+        conn.execute("INSERT INTO itemData VALUES (?,1,?)", (i, i))
+        conn.execute("INSERT INTO items VALUES (?,?,2)", (100 + i, f"ATT{i}"))
+        conn.execute("INSERT INTO itemAttachments VALUES (?,?,'application/pdf')", (100 + i, i))
+        if key in trashed_keys:
+            conn.execute("INSERT INTO deletedItems VALUES (?)", (i,))
+    conn.commit()
+    conn.close()
+
+
+def test_trashed_items_are_not_reported_as_missing(tmp_path, monkeypatch):
+    """Items in Zotero's trash are excluded from indexing by design, so listing
+    them as "not indexed" reports the user's own deletion back as a failure."""
+    from zotero_mcp import check_missing_fulltext as cmf
+
+    db = tmp_path / "zotero.sqlite"
+    _fixture_zotero_db(db, trashed_keys=("TRASHED1",))
+    monkeypatch.setattr(cmf, "find_zotero_db", lambda: str(db))
+
+    items = cmf.get_items_with_pdf_attachments()
+
+    assert set(items) == {"KEEPME01"}

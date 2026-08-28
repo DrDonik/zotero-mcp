@@ -71,6 +71,10 @@ def get_items_with_pdf_attachments():
     LEFT JOIN itemCreators ic ON i.itemID = ic.itemID AND ic.orderIndex = 0
     LEFT JOIN creators creator ON ic.creatorID = creator.creatorID
     WHERE it.typeName NOT IN ('attachment', 'note', 'annotation')
+        -- Trashed items are deliberately not indexed (the local scan excludes
+        -- deletedItems at its source), so reporting them as missing describes
+        -- the user's own decision as a failure.
+        AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
         AND EXISTS (
             SELECT 1 FROM itemAttachments ia
             WHERE ia.parentItemID = i.itemID
