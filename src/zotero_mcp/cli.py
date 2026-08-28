@@ -913,6 +913,12 @@ def main():
     repair_db_parser.add_argument("--config-path",
                                   help="Path to semantic search configuration file")
 
+    # Check missing fulltext command
+    missing_parser = subparsers.add_parser("check-missing-fulltext", help="Check for PDF items with missing/empty fulltext in ChromaDB")
+    missing_parser.add_argument("--format", choices=["text", "csv", "json"], default="text",
+                               help="Output format (default: text)")
+    missing_parser.add_argument("--config-path", help="Path to semantic search configuration file")
+
     # Update command
     update_parser = subparsers.add_parser("update", help="Update zotero-mcp to the latest version")
     update_parser.add_argument("--check-only", action="store_true",
@@ -1498,6 +1504,21 @@ def main():
 
         except Exception as e:
             print(f"Error inspecting database: {e}")
+            sys.exit(1)
+
+    elif args.command == "check-missing-fulltext":
+        # Setup Zotero environment variables
+        setup_zotero_environment()
+
+        from zotero_mcp.check_missing_fulltext import check_chromadb_fulltext
+
+        try:
+            check_chromadb_fulltext(output_format=args.format, config_path=args.config_path)
+
+        except Exception as e:
+            print(f"Error checking missing fulltext: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
 
     elif args.command == "update":
