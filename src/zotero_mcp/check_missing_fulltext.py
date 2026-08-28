@@ -35,12 +35,24 @@ def find_zotero_db():
     return LocalZoteroReader().db_path
 
 
+def open_zotero_db():
+    """A read-only connection that works while Zotero itself is running.
+
+    Zotero keeps its database in rollback-journal mode and holds a write lock
+    for as long as the app is open, which blocks even a `mode=ro` connection
+    with "database is locked". `immutable=1` skips lock checking altogether —
+    the same trade `LocalZoteroReader._get_connection` makes, and for the same
+    reason: this path only ever reads, and tolerating slightly stale data
+    beats refusing to run unless the user quits Zotero.
+    """
+    conn = sqlite3.connect(f"file:{find_zotero_db()}?immutable=1", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def get_items_with_pdf_attachments():
     """Get all Zotero items that have PDF attachments."""
-    db_path = find_zotero_db()
-    uri = f"file:{db_path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = open_zotero_db()
 
     # Get items with PDF attachments
     query = """

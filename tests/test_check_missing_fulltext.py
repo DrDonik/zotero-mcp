@@ -123,3 +123,26 @@ def test_item_key_falls_back_to_the_id_prefix():
     indexed = aggregate_indexed_items(collection)
 
     assert indexed["LEGACY11"]["chunks"] == 2
+
+
+def test_zotero_db_is_opened_immutable(monkeypatch):
+    """Zotero holds a write lock while it runs, and `mode=ro` is not exempt:
+    the report died with "database is locked" whenever the app was open."""
+    import sqlite3
+
+    from zotero_mcp import check_missing_fulltext as cmf
+
+    seen = {}
+    real_connect = sqlite3.connect
+
+    def fake_connect(dsn, *args, **kwargs):
+        seen["dsn"] = dsn
+        return real_connect(":memory:")
+
+    monkeypatch.setattr(cmf, "find_zotero_db", lambda: "/tmp/zotero.sqlite")
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+
+    cmf.open_zotero_db()
+
+    assert "immutable=1" in seen["dsn"]
+    assert "mode=ro" not in seen["dsn"]
