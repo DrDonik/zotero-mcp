@@ -417,3 +417,10 @@ def test_missing_file_still_counts_as_failure(monkeypatch):
     attachments = [("SNAPATT1", "storage:page.html", "text/html")]
     items, reader, search = _run_scan_no_text(monkeypatch, None, attachments=attachments)
     assert search._create_metadata(items[0])["has_fulltext"] == "failed"
+
+
+def test_edited_metadata_only_link_item_is_reindexed(monkeypatch):
+    """Without a text marker, the item's date is what shows an edit."""
+    stored = {"date_modified": "2026-06-30 12:00:00", "attachment_keys": "LINKATT1"}
+    items, reader = _run_scan(monkeypatch, stored, attachments=LINK_ONLY)
+    assert [it["key"] for it in items] == ["ITEMKEY1"]

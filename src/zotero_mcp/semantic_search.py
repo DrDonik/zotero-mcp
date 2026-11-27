@@ -2412,6 +2412,16 @@ class ZoteroSemanticSearch:
                                 elif not chroma_has_fulltext and local_has_fulltext:
                                     # Document exists but lacks fulltext - we need to update it
                                     updated_existing += 1
+                                elif not chroma_has_fulltext and not _same_moment(
+                                    existing_metadata.get("date_modified", ""),
+                                    getattr(it, "date_modified", "") or "",
+                                ):
+                                    # Metadata-only record (no attachments, or
+                                    # only links / unreadable formats) whose
+                                    # item was edited: its title and abstract
+                                    # are all the index holds, so re-index
+                                    # rather than keep serving the old ones.
+                                    updated_existing += 1
                                 elif _attachment_priority_changed(
                                     existing_metadata, priority_tag
                                 ):
