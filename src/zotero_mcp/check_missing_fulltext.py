@@ -9,7 +9,10 @@ could not reach.
 Chunking (`semantic_search.chunking`) stores one document per passage, all
 sharing the parent's `item_key`, so every figure here is aggregated per item:
 an item's length is the sum over its passages, and a single passage's
-`has_fulltext` marker speaks for the whole item.
+`has_fulltext` marker speaks for the whole item. Since 0.17.0 the passages
+live in their own collection (`<name>_passages`) next to one article record
+per item; both collections are read, and an index built before the split
+(passages still in the article collection) is read the same way.
 """
 
 import csv
@@ -114,43 +117,76 @@ def iter_indexed_documents(collection, batch_size: int = 500) -> Iterator[tuple[
         yield chunk, collection.get(ids=chunk, include=["documents", "metadatas"])
 
 
-def aggregate_indexed_items(collection, batch_size: int = 500) -> dict[str, dict[str, Any]]:
-    """Fold the collection into one record per Zotero item.
+def aggregate_indexed_items(collections, batch_size: int = 500) -> dict[str, dict[str, Any]]:
+    """Fold one or more collections into one record per Zotero item.
 
-    Returns ``{item_key: {"length", "chunks", "has_fulltext"}}`` where length
-    sums the item's passages. ``has_fulltext`` keeps the strongest marker any
-    passage carries: ``"failed"`` (extraction was tried and gave up) outranks
-    ``True``, which outranks a missing marker.
+    ``collections`` is a single collection or a list of them, as
+    ``ChromaClient.collections()`` returns: the article collection, then the
+    passage collection if the index has one (0.17.0 split them apart). Both
+    layouts count the same way:
+
+    * An item with passages (id ``KEY#n``, in either collection) gets the sum
+      of its passages' lengths and their count. Its one-vector article record
+      is left out of both, since its text is a truncated copy of the same
+      full text and would be counted twice.
+    * An item with only an article record (chunking off) gets that record's
+      length and a count of 1.
+
+    Returns ``{item_key: {"length", "chunks", "has_fulltext"}}``.
+    ``has_fulltext`` keeps the strongest marker any record carries:
+    ``"failed"`` (extraction was tried and gave up) outranks ``True``, which
+    outranks a missing marker.
     """
+    if not isinstance(collections, (list, tuple)):
+        collections = [collections]
+    parts: dict[str, dict[str, Any]] = {}
+    for collection in collections:
+        for _chunk_ids, result in iter_indexed_documents(collection, batch_size):
+            ids = result.get("ids") or []
+            documents = result.get("documents") or []
+            metadatas = result.get("metadatas") or []
+            for i, doc_id in enumerate(ids):
+                metadata = metadatas[i] if i < len(metadatas) else {}
+                metadata = metadata or {}
+                # Chunks inherit the parent's item_key; parent_item_key and the
+                # `KEY#n` id shape are the fallbacks if that ever stops holding.
+                item_key = (
+                    metadata.get("item_key")
+                    or metadata.get("parent_item_key")
+                    or str(doc_id).split("#", 1)[0]
+                )
+                if not item_key:
+                    continue
+                is_passage = "#" in str(doc_id) or "chunk_index" in metadata
+                doc = documents[i] if i < len(documents) else ""
+                record = parts.setdefault(item_key, {
+                    "article_length": 0, "articles": 0,
+                    "passage_length": 0, "passages": 0,
+                    "has_fulltext": False,
+                })
+                length = len((doc or "").strip())
+                if is_passage:
+                    record["passage_length"] += length
+                    record["passages"] += 1
+                else:
+                    record["article_length"] += length
+                    record["articles"] += 1
+                marker = metadata.get("has_fulltext", False)
+                if record["has_fulltext"] != "failed":
+                    if marker == "failed":
+                        record["has_fulltext"] = "failed"
+                    elif marker:
+                        record["has_fulltext"] = True
+
     items: dict[str, dict[str, Any]] = {}
-    for _chunk_ids, result in iter_indexed_documents(collection, batch_size):
-        ids = result.get("ids") or []
-        documents = result.get("documents") or []
-        metadatas = result.get("metadatas") or []
-        for i, doc_id in enumerate(ids):
-            metadata = metadatas[i] if i < len(metadatas) else {}
-            metadata = metadata or {}
-            # Chunks inherit the parent's item_key; parent_item_key and the
-            # `KEY#n` id shape are the fallbacks if that ever stops holding.
-            item_key = (
-                metadata.get("item_key")
-                or metadata.get("parent_item_key")
-                or str(doc_id).split("#", 1)[0]
-            )
-            if not item_key:
-                continue
-            doc = documents[i] if i < len(documents) else ""
-            record = items.setdefault(
-                item_key, {"length": 0, "chunks": 0, "has_fulltext": False}
-            )
-            record["length"] += len((doc or "").strip())
-            record["chunks"] += 1
-            marker = metadata.get("has_fulltext", False)
-            if record["has_fulltext"] != "failed":
-                if marker == "failed":
-                    record["has_fulltext"] = "failed"
-                elif marker:
-                    record["has_fulltext"] = True
+    for item_key, record in parts.items():
+        if record["passages"]:
+            length, chunks = record["passage_length"], record["passages"]
+        else:
+            length, chunks = record["article_length"], record["articles"]
+        items[item_key] = {
+            "length": length, "chunks": chunks, "has_fulltext": record["has_fulltext"],
+        }
     return items
 
 
@@ -207,7 +243,7 @@ def check_chromadb_fulltext(output_format="text", config_path=None):
     chroma_client = create_chroma_client(config_path)
 
     print("Querying ChromaDB for fulltext data...", file=sys.stderr)
-    indexed = aggregate_indexed_items(chroma_client.collection)
+    indexed = aggregate_indexed_items(chroma_client.collections())
     print(f"Found {len(indexed)} items in ChromaDB", file=sys.stderr)
 
     failures = find_missing_fulltext(pdf_items, indexed)
