@@ -35,9 +35,11 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from zotero_mcp import strict_sqlite as _strict_sqlite
 from zotero_mcp import utils as _utils
 from pyzotero.zotero_errors import ResourceNotFoundError
 
@@ -78,10 +80,11 @@ class LibraryBackend(Protocol):
     distinction to report a bad key differently from an empty one.
     """
 
-    def get_related(self, key: str) -> list[dict]: ...
     def find_by_citation_key(self, citekey: str) -> dict | None: ...
     def recent_items(self, *, limit: int = 10, collection_key: str | None = None) -> list[dict]: ...
-    def top_items(self, *, limit: int = 100) -> list[dict]: ...
+    def duplicate_scan_items(self, collection_key: str | None = None) -> list[dict] | None:
+        """Unbounded local scan, or None to request the caller's bounded API path."""
+        ...
     def list_items(
         self,
         item_type: str | None = None,
@@ -96,6 +99,13 @@ class LibraryBackend(Protocol):
     def collection_items(
         self, key: str, *, include_subcollections: bool = False
     ) -> list[dict] | None: ...
+    def collection_page(
+        self, key: str, *, limit: int, offset: int = 0, include_subcollections: bool = False
+    ) -> tuple[list[dict], list[dict], int] | None:
+        """One page of a collection's top-level entries (see
+        :func:`is_top_level_item`), the child attachments and notes of those
+        entries, and the number of entries in all. None for an unknown key."""
+        ...
 
     # -- tags -------------------------------------------------------------
     def list_tags(self, *, limit: int | None = None) -> list[str]: ...
@@ -115,6 +125,27 @@ class LibraryBackend(Protocol):
 
     # -- files ------------------------------------------------------------
     def attachment_paths(self, key: str) -> list[dict]: ...
+
+
+def is_standalone_attachment(data: dict) -> bool:
+    """True for a file dragged into Zotero with no parent metadata item.
+
+    Such an attachment is itself a top-level item, not a child (#224).
+    """
+    return data.get("itemType") == "attachment" and not data.get("parentItem")
+
+
+def is_top_level_item(item: dict) -> bool:
+    """Whether an item is listed as a top-level entry of a collection.
+
+    Keeps real parent items and standalone attachments; excludes children
+    that hang off a parent. Standalone notes are excluded too — they carry
+    no useful title and are out of scope for the collection listing.
+    """
+    data = item.get("data", {})
+    if data.get("itemType", "") not in ("attachment", "note", "annotation"):
+        return True
+    return is_standalone_attachment(data)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +195,11 @@ class SqliteBackend:
         self._reader = reader
         self._group_id = group_id
 
+    def duplicate_scan_items(self, collection_key: str | None = None) -> list[dict]:
+        return self._reader.get_duplicate_scan_items(
+            collection_key=collection_key, group_id=self._group_id,
+        )
+
     # -- items ------------------------------------------------------------
 
     def get_item(self, key: str) -> dict | None:
@@ -177,9 +213,6 @@ class SqliteBackend:
             list(keys), item_type=item_type, group_id=self._group_id
         )
 
-    def get_related(self, key: str) -> list[dict]:
-        return self._reader.get_related_items(key, group_id=self._group_id)
-
     def find_by_citation_key(self, citekey: str) -> dict | None:
         return self._reader.find_by_citation_key(citekey, group_id=self._group_id)
 
@@ -189,12 +222,6 @@ class SqliteBackend:
         )
         if result is None:
             raise UnsupportedByBackend("that sort order is not available from SQLite")
-        return result
-
-    def top_items(self, *, limit: int = 100) -> list[dict]:
-        result = self._reader.get_recent_items(limit=limit, group_id=self._group_id)
-        if result is None:
-            raise UnsupportedByBackend("top-level listing is not available from SQLite")
         return result
 
     def list_items(
@@ -247,6 +274,27 @@ class SqliteBackend:
                 seen.add(child["key"])
                 items.append(child)
         return items
+
+    def collection_page(
+        self, key: str, *, limit: int, offset: int = 0, include_subcollections: bool = False
+    ) -> tuple[list[dict], list[dict], int] | None:
+        page = self._reader.get_collection_page(
+            key, limit=limit, offset=offset,
+            include_subcollections=include_subcollections, group_id=self._group_id,
+        )
+        if page is None:
+            return None
+        entries, total = page
+        by_parent = self._reader.get_children_of(
+            [entry["key"] for entry in entries], group_id=self._group_id
+        )
+        children = [
+            child
+            for kids in by_parent.values()
+            for child in kids
+            if child.get("data", {}).get("itemType") != "annotation"
+        ]
+        return entries, children, total
 
     # -- tags -------------------------------------------------------------
 
@@ -304,6 +352,10 @@ class ApiBackend:
     def __init__(self, zot):
         self._zot = zot
 
+    def duplicate_scan_items(self, collection_key: str | None = None) -> None:
+        # HTTP scans must retain the caller's request/count ceiling.
+        return None
+
     # -- items ------------------------------------------------------------
 
     def get_item(self, key: str) -> dict | None:
@@ -360,22 +412,8 @@ class ApiBackend:
                 continue
         return result
 
-    def get_related(self, key: str) -> list[dict]:
-        import re
-
-        item = self.get_item(key)
-        if not item:
-            return []
-        related: list[dict] = []
-        seen: set[str] = set()
-        for objects in (item.get("data", {}).get("relations") or {}).values():
-            for uri in objects if isinstance(objects, list) else [objects]:
-                match = re.search(r"/items/([A-Z0-9]{8})$", uri) if isinstance(uri, str) else None
-                if match and match.group(1) not in seen:
-                    seen.add(match.group(1))
-                    if (fetched := self.get_item(match.group(1))) is not None:
-                        related.append(fetched)
-        return related
+    #: Seconds the citation-key scan may spend reading the library.
+    _CITEKEY_SCAN_BUDGET = 20.0
 
     def find_by_citation_key(self, citekey: str) -> dict | None:
         # No indexed field to query server-side. The web API's quick search
@@ -397,21 +435,39 @@ class ApiBackend:
         for item in self._zot.items() or []:
             if matches(item):
                 return item
-        found = _utils._paginate(self._zot.top, keep=matches, max_items=1)
-        return found[0] if found else None
+        # Bounded like the advanced-search walk (#456): a key that is not in
+        # the library used to read all of it, 100 items a request, holding the
+        # API lock the whole way.
+        deadline = time.monotonic() + self._CITEKEY_SCAN_BUDGET
+        start, page_size = 0, 100
+        while True:
+            batch = self._zot.top(start=start, limit=page_size) or []
+            for item in batch:
+                if matches(item):
+                    return item
+            if len(batch) < page_size:
+                return None
+            start += page_size
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"citation key '{citekey}' was not among the first {start} items "
+                    f"read in {self._CITEKEY_SCAN_BUDGET:.0f}s, and the Zotero API cannot "
+                    "look a citation key up directly. In local mode the SQLite "
+                    "backend finds it at once."
+                )
 
     def recent_items(self, *, limit: int = 10, collection_key: str | None = None) -> list[dict]:
+        # Top-level items only, as the SQLite backend answers. The plain
+        # /items listing also returns every child attachment and note, so the
+        # ten most recent were mostly the PDFs of the last few papers.
         if collection_key:
             return _utils._paginate(
-                self._zot.collection_items, collection_key,
+                self._zot.collection_items_top, collection_key,
                 sort="dateAdded", direction="desc", max_items=limit,
             )[:limit]
         return _utils._paginate(
-            self._zot.items, sort="dateAdded", direction="desc", max_items=limit
+            self._zot.top, sort="dateAdded", direction="desc", max_items=limit
         )[:limit]
-
-    def top_items(self, *, limit: int = 100) -> list[dict]:
-        return _utils._paginate(self._zot.top, max_items=limit)[:limit]
 
     def list_items(
         self,
@@ -468,6 +524,22 @@ class ApiBackend:
                     seen.add(item["key"])
                     items.append(item)
         return items
+
+    def collection_page(
+        self, key: str, *, limit: int, offset: int = 0, include_subcollections: bool = False
+    ) -> tuple[list[dict], list[dict], int] | None:
+        # The API has no listing of "top-level entries with their children",
+        # so the whole collection is read and the window cut here.
+        items = self.collection_items(key, include_subcollections=include_subcollections)
+        if items is None:
+            return None
+        entries = [item for item in items if is_top_level_item(item)]
+        page = entries[offset:offset + limit]
+        shown = {entry.get("key") for entry in page}
+        children = [
+            item for item in items if item.get("data", {}).get("parentItem") in shown
+        ]
+        return page, children, len(entries)
 
     # -- tags -------------------------------------------------------------
 
@@ -571,6 +643,8 @@ class FallbackBackend:
             try:
                 return target(*args, **kwargs)
             except UnsupportedByBackend as exc:
+                if _strict_sqlite.is_active():
+                    raise _strict_sqlite.declined(attr, exc) from exc
                 logger.debug("SQLite cannot answer %s (%s); asking the API", attr, exc)
                 return getattr(self._api_backend(), attr)(*args, **kwargs)
 
@@ -613,15 +687,20 @@ def get_library_backend(zot=None) -> LibraryBackend:
                 lambda: ApiBackend(zot if zot is not None else _client.get_zotero_client()),
             )
 
+    if _strict_sqlite.is_active():
+        raise _strict_sqlite.no_database()
+
     return ApiBackend(zot if zot is not None else _client.get_zotero_client())
 
 
-def attachment_path_for(key: str) -> Path | None:
+def attachment_path_for(key: str, *, own_only: bool = False) -> Path | None:
     """Best local path for an attachment key, or None.
 
     Reads ``zotero.sqlite`` directly regardless of the configured backend:
     the file lives on this machine either way, and resolving it locally is
     both faster than downloading and the only option with Zotero closed.
+    A parent item's key gives its first attachment on disk, unless
+    ``own_only``, for a caller that has not checked ``key`` is an attachment.
     """
     reader = _sqlite_reader()
     if reader is None:
@@ -631,8 +710,8 @@ def attachment_path_for(key: str) -> Path | None:
     # for them and every outline read copied or downloaded a file that was
     # already on disk.
     path = reader.resolve_attachment_file(key)
-    if path is not None:
-        return Path(path)
+    if path is not None or own_only:
+        return Path(path) if path is not None else None
     for entry in reader.get_attachment_paths(key):
         resolved = entry.get("resolved_path")
         if resolved and entry.get("exists"):

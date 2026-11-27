@@ -219,6 +219,32 @@ class TestAuthorParsing:
             ("Smith", "John"), ("Doe", "Jane"), ("Roe", "Richard"),
         ]
 
+    @pytest.mark.parametrize("corporate", [
+        "Centers for Disease Control and Prevention",
+        "Johnson and Johnson",
+        "Department of Health and Human Services",
+    ])
+    def test_brace_protected_author_with_and_survives_full_import(self, corporate):
+        """A corporate name written ``{{Name}}`` stays one creator after
+        ``parse_bibtex``, which decodes the field values."""
+        bib = (
+            "@misc{k,\n"
+            f"  author = {{{{{corporate}}} and {{Doe, Jane}}}},\n"
+            "  title = {T}, year = {2020}\n}"
+        )
+        item = bibtex_entry_to_zotero(parse_bibtex(bib)[0], make_template)
+        assert item["creators"] == [
+            {"creatorType": "author", "name": corporate},
+            {"creatorType": "author", "firstName": "Jane", "lastName": "Doe"},
+        ]
+
+    def test_accented_author_survives_full_import(self):
+        bib = r"@article{k, author = {M{\"u}ller, Hans and {\'E}mile Zola}, title = {T}, year = {2020}}"
+        item = bibtex_entry_to_zotero(parse_bibtex(bib)[0], make_template)
+        assert [(c["firstName"], c["lastName"]) for c in item["creators"]] == [
+            ("Hans", "Müller"), ("Émile", "Zola"),
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Date parsing
@@ -831,3 +857,32 @@ class TestNativePubmedIds:
         )
         assert item["journalAbbreviation"] == "Journal of Business Venturing"
         assert item["libraryCatalog"] == "Crossref"
+
+
+class TestParseBibtexOnEitherParser:
+    """parse_bibtex runs on bibtexparser 1.x or 2.x, whichever pyzotero
+    brought in; what it returns must not depend on which."""
+
+    def test_accents_decode_and_a_url_is_left_alone(self):
+        entry, = parse_bibtex(
+            r'@Article{k, Author = {M{\"u}ller, J{\'o}hn}, '
+            r'url = {https://x.test/a_b?c=d&e=f}, pages = {1--10}, year = 2020}'
+        )
+        assert entry["entry_type"] == "article"
+        assert entry["citekey"] == "k"
+        assert entry["fields"]["author"] == "Müller, Jóhn"
+        assert entry["fields"]["url"] == "https://x.test/a_b?c=d&e=f"
+        assert entry["fields"]["pages"] == "1--10"
+        assert entry["fields"]["year"] == "2020"
+
+    def test_string_macros_resolve(self):
+        entry, = parse_bibtex('@string{j = "Journal of Tests"}\n@article{k, journal = j}')
+        assert entry["fields"]["journal"] == "Journal of Tests"
+
+    def test_entries_sharing_a_citekey_are_all_kept(self):
+        entries = parse_bibtex("@article{k, title={One}}\n@article{k, title={Two}}")
+        assert [e["fields"]["title"] for e in entries] == ["One", "Two"]
+
+    def test_a_broken_entry_does_not_take_the_next_one_with_it(self):
+        entries = parse_bibtex("@misc{bad, title = {Unclosed\n@book{ok, title={Fine}}")
+        assert [e["citekey"] for e in entries] == ["ok"]

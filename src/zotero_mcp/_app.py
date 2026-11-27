@@ -6,11 +6,11 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastmcp import FastMCP
-
+from zotero_mcp import _serverless
 from zotero_mcp._context import sync_context
 from zotero_mcp._version import __version__
 from zotero_mcp.utils import is_local_mode
@@ -50,7 +50,7 @@ def _semantic_update_command() -> list[str] | None:
     if not should_update(update_cfg):
         return None
 
-    cmd = [sys.executable, "-m", "zotero_mcp.cli", "update-db"]
+    cmd = [sys.executable, "-m", "zotero_mcp.cli", "update-db", "--automatic"]
     if is_local_mode():
         cmd.append("--fulltext")
     return cmd
@@ -68,6 +68,9 @@ def _spawn_semantic_update(cmd: list[str]) -> subprocess.Popen:
     stdin is DEVNULL and stdout/stderr are a pipe to us, never the client's
     pipes: a child that outlived the server would otherwise hold them open
     and the client would never see the connection close (#431).
+
+    On POSIX the child leads its own session, so ``_stop_semantic_update`` can
+    signal it together with the processes it started (the extraction pool).
     """
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -80,32 +83,89 @@ def _spawn_semantic_update(cmd: list[str]) -> subprocess.Popen:
         encoding="utf-8",
         errors="replace",
         env=env,
+        start_new_session=os.name != "nt",
         # A console child of a windowless server would open a console window.
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
 
+def _signal_update_tree(proc: subprocess.Popen, force: bool) -> None:
+    """Signal the update child and every process it started."""
+    if os.name == "nt":
+        # TerminateProcess reaches one process only; taskkill /T walks the tree.
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+        return
+    import signal
+
+    try:
+        # The child is its session's leader, so its pid is the group's id.
+        os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        if proc.poll() is None:
+            proc.kill() if force else proc.terminate()
+
+
+def _stop_semantic_update(proc: subprocess.Popen, grace: float = 3.0) -> None:
+    """Stop an unfinished update together with its worker processes.
+
+    Terminating the child alone orphaned its extraction pool: the workers
+    lived on, and they held the write end of the output pipe, so whoever was
+    reading it never saw it close and the server could not exit.
+
+    Call it only for a child that is still running. Workers that outlast the
+    child's own exit (one in the middle of a PDF, the resource tracker) are
+    killed right after it.
+    """
+    _signal_update_tree(proc, force=False)
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        _signal_update_tree(proc, force=True)
+    else:
+        if os.name != "nt":
+            _signal_update_tree(proc, force=True)
+
+
 def _relay_update_output(proc: subprocess.Popen) -> None:
     """Copy the child's output to our stderr (the client's log) until it exits."""
-    for line in proc.stdout:
-        sys.stderr.write(line)
+    try:
+        for line in proc.stdout:
+            sys.stderr.write(line)
+    except ValueError:
+        return  # our stderr was closed under us at interpreter exit
     returncode = proc.wait()
     if returncode != 0:
         sys.stderr.write(f"Warning: semantic search auto-update exited with code {returncode}\n")
 
 
 @asynccontextmanager
-async def server_lifespan(server: FastMCP):
+async def server_lifespan(server: "FastMCP"):
     """Manage server startup and shutdown lifecycle.
 
     The semantic auto-update runs as a child ``zotero-mcp update-db`` process
     (see ``_spawn_semantic_update``), with only the relay of its output on a
-    worker thread, so nothing it does can hold up the MCP handshake (#706).
+    daemon thread, so nothing it does can hold up the MCP handshake (#706) or,
+    should something keep the pipe open, the server's exit.
     The update lock in ``update_database`` still keeps it from racing a
     manual ``update-db`` or another server.
 
-    On shutdown an unfinished update is terminated: ChromaDB (SQLite WAL)
-    is crash-safe, so it simply resumes on the next startup.
+    On shutdown an unfinished update is stopped, workers included
+    (``_stop_semantic_update``): ChromaDB (SQLite WAL) is crash-safe, so it
+    simply resumes on the next startup.
     """
     sys.stderr.write("Starting Zotero MCP server...\n")
     update_proc: subprocess.Popen | None = None
@@ -123,7 +183,10 @@ async def server_lifespan(server: FastMCP):
                 return
             sys.stderr.write("Auto-updating semantic search database...\n")
             update_proc = _spawn_semantic_update(cmd)
-            await asyncio.to_thread(_relay_update_output, update_proc)
+            threading.Thread(
+                target=_relay_update_output, args=(update_proc,),
+                name="zotero-mcp-update-relay", daemon=True,
+            ).start()
         except Exception as e:
             sys.stderr.write(f"Warning: Could not run semantic search auto-update: {e}\n")
 
@@ -145,20 +208,74 @@ async def server_lifespan(server: FastMCP):
     yield {}
 
     sys.stderr.write("Shutting down Zotero MCP server...\n")
+    # Only while it is still running: once it has been reaped its pid, and
+    # so its group id, can belong to something else. Not awaited, because
+    # the lifespan may be unwinding under cancellation.
     if update_proc is not None and update_proc.poll() is None:
-        update_proc.terminate()
+        _stop_semantic_update(update_proc)
     chroma_worker.stop_all()
 
 
-class _ZoteroMCP(FastMCP):
-    """FastMCP whose tools get a context they can log to synchronously."""
+if _serverless.ENABLED:
+    # zotero-cli: the decorators leave the tools as plain functions.
+    mcp = _serverless.App()
+else:
+    from fastmcp import FastMCP
 
-    def tool(self, name_or_fn=None, **kwargs):
-        if callable(name_or_fn):
-            return super().tool(sync_context(name_or_fn), **kwargs)
-        register = super().tool(name_or_fn, **kwargs)
-        return lambda fn: register(sync_context(fn))
+    from zotero_mcp._tool_schema import advertise, drop_null_defaults
 
+    class _ZoteroMCP(FastMCP):
+        """FastMCP whose tools get a context they can log to synchronously.
 
-# Create an MCP server (fastmcp 2.14+ no longer accepts `dependencies`)
-mcp = _ZoteroMCP("Zotero", version=__version__, lifespan=server_lifespan)
+        Tools return markdown strings, and FastMCP would advertise each one with
+        an ``{"result": string}`` output schema and send the same text twice, as
+        content and as structured content. The schema tells a client nothing the
+        text does not, yet costs ~35 tokens per tool on every request, so it is
+        off unless a tool asks for one.
+
+        The registered copy of each tool also differs from the module function
+        in what it advertises: when the tool has a ``description``, its docstring
+        is hidden, because FastMCP would otherwise turn the docstring's Args into
+        per-parameter descriptions that repeat the tool description; and its
+        parameter schemas are compacted (see :mod:`zotero_mcp._tool_schema`).
+        The module function, which the CLI and tests call, keeps its docstring.
+        """
+
+        def tool(self, name_or_fn=None, **kwargs):
+            kwargs.setdefault("output_schema", None)
+
+            def register(fn, decorator):
+                registered = sync_context(fn)
+                if kwargs.get("description"):
+                    registered.__doc__ = None
+                advertise(registered, fn)
+                decorator(registered)
+                return sync_context(fn)
+
+            if callable(name_or_fn):
+                return register(name_or_fn, lambda f: super(_ZoteroMCP, self).tool(f, **kwargs))
+            decorator = super().tool(name_or_fn, **kwargs)
+            return lambda fn: register(fn, decorator)
+
+        async def list_tools(self, *args, **kwargs):
+            # Every listing, the client's included, comes through here on
+            # FastMCP 3 and 4. The tools are the registered objects, so after
+            # the first listing there is nothing left to drop. Should a
+            # release list them some other way, the schemas are merely as
+            # FastMCP generated them.
+            tools = await super().list_tools(*args, **kwargs)
+            try:
+                for tool in tools:
+                    drop_null_defaults(getattr(tool, "parameters", None))
+            except Exception:  # pragma: no cover - defensive
+                pass
+            return tools
+
+        def resource(self, uri, **kwargs):
+            # Resources read the active library too, which on HTTP is the
+            # client session's (#739).
+            register = super().resource(uri, **kwargs)
+            return lambda fn: register(sync_context(fn))
+
+    # Create an MCP server (fastmcp 2.14+ no longer accepts `dependencies`)
+    mcp = _ZoteroMCP("Zotero", version=__version__, lifespan=server_lifespan)

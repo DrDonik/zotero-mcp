@@ -2,13 +2,17 @@ import contextlib
 import json
 import logging
 import os
+import html
 import re
 import sys
 import tempfile
 import threading
 from contextlib import contextmanager
+from urllib.parse import parse_qsl
 
 from unidecode import unidecode
+
+from zotero_mcp import strict_sqlite
 
 html_re = re.compile(r"<.*?>")
 
@@ -302,7 +306,12 @@ def get_search_backend() -> str:
     :func:`zotero_mcp.library.configured_backend` delegates here, so the
     read port and the older search paths can never disagree about which
     backend is selected.
+
+    Strict SQLite mode overrides every setting here: its point is that nothing
+    reads through the API.
     """
+    if strict_sqlite.is_active():
+        return "sqlite"
     chosen = {
         os.getenv(var, "").strip().lower()
         for var in ("ZOTERO_BACKEND", "ZOTERO_SEARCH_BACKEND")
@@ -434,6 +443,39 @@ def item_display_date(data: dict) -> str:
     return str(data.get("date") or "")
 
 
+_ATTACHMENT_SIGNING_FIELDS = {
+    "awsaccesskeyid",
+    "googleaccessid",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "x-amz-signature",
+    "x-goog-credential",
+    "x-goog-signature",
+}
+
+
+def redact_signed_attachment_url(data: dict) -> dict:
+    """Omit recognized signed download URLs from a displayed attachment.
+
+    Return a copy when redacting so backend records retain the original URL.
+    """
+    url = data.get("url")
+    if data.get("itemType") != "attachment" or not isinstance(url, str):
+        return data
+
+    query = url.partition("#")[0].partition("?")[2]
+    names = {name.casefold() for name, _ in parse_qsl(query, keep_blank_values=True)}
+    if (
+        names & _ATTACHMENT_SIGNING_FIELDS
+        or {"key-pair-id", "signature"} <= names  # CloudFront
+        or {"sig", "sv"} <= names  # Azure Storage SAS
+    ):
+        redacted = data.copy()
+        del redacted["url"]
+        return redacted
+    return data
+
+
 def library_label(item: dict) -> str | None:
     """Human-readable source library for one item, or None if unattributed.
 
@@ -536,7 +578,8 @@ def clean_html(raw_html: str, collapse_whitespace: bool = False) -> str:
     """
     if not raw_html:
         return ""
-    clean_text = re.sub(html_re, "", raw_html)
+    # Entities after the tags, so an escaped "&lt;b&gt;" stays text (#621).
+    clean_text = html.unescape(re.sub(html_re, "", raw_html))
     if collapse_whitespace:
         clean_text = re.sub(r'\s+', ' ', clean_text).strip()
     return clean_text
@@ -717,36 +760,43 @@ def _generate_search_variants(query: str) -> list[str]:
     Returns a deduplicated list of query variants, capped at
     ``MAX_SEARCH_VARIANTS``.  Typically produces 2-5 variants for real
     author names.
+
+    The order is fixed: the query as typed first, then each derived form in
+    the order it is generated below. It used to be a set's iteration order,
+    which for strings changes with every interpreter's hash seed — and the
+    API search path lists each variant's hits in variant order, so the same
+    search ranked its results differently from one server start to the next.
     """
     if not query or not query.strip():
         return [query] if query else []
 
-    variants: set[str] = {query}
+    # A dict rather than a set: deduplicates the same way, keeps insertion order.
+    variants: dict[str, None] = {query: None}
 
     # ASCII transliteration (Müller → Muller, 王 → Wang)
     ascii_form = _normalize_for_search(query)
     if ascii_form != query:
-        variants.add(ascii_form)
+        variants[ascii_form] = None
 
     # Dashes to spaces (Cladder-Micus → Cladder Micus)
     dash_to_space = query.replace('-', ' ')
     if dash_to_space != query:
-        variants.add(dash_to_space)
+        variants[dash_to_space] = None
     dash_to_space_norm = ascii_form.replace('-', ' ')
     if dash_to_space_norm not in variants:
-        variants.add(dash_to_space_norm)
+        variants[dash_to_space_norm] = None
 
     # German umlaut expansions (Müller → Mueller)
     umlaut_expanded = query
     for char, expansion in _UMLAUT_MAP.items():
         umlaut_expanded = umlaut_expanded.replace(char, expansion)
     if umlaut_expanded != query:
-        variants.add(umlaut_expanded)
+        variants[umlaut_expanded] = None
 
     # Spaces to dashes (Cladder Micus → Cladder-Micus)
     if ' ' in query and '-' not in query:
         space_to_dash = query.replace(' ', '-')
-        variants.add(space_to_dash)
+        variants[space_to_dash] = None
 
     # Cap variants
     result = list(variants)

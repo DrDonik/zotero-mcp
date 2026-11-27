@@ -1,6 +1,7 @@
 // Puts the panel in Zotero's main window. Measured on Zotero 10: #tabs-deck sits in an hbox below the tab bar,
 // so a sibling appended to that hbox is right of the library AND of every reader tab, and stays put when tabs switch.
 import type { Panel } from "./panel.ts";
+import { startupWord } from "../locales/languages.ts";
 
 const XHTML = "http://www.w3.org/1999/xhtml";
 const MIN_W = 300;
@@ -86,15 +87,19 @@ export function injectPanel(win: any, load: (shadow: ShadowRoot) => Panel, prefs
 
   // The UI, agent and host load the first time the panel is shown; with the panel closed they cost nothing.
   let panelApi: Panel | null = null;
-  const ensure = () => (panelApi ??= load(shadow));
+  const ensure = () => {
+    if (!panelApi) { panelApi = load(shadow); panelApi.setVisible(open); }
+    return panelApi;
+  };
 
   // Toolbar toggle, in the tab bar's own toolbar (right of the tabs menu).
   const toolbar = doc.getElementById("zotero-tabs-toolbar");
   const button = doc.createXULElement("toolbarbutton");
   button.id = "zmc-toggle";
   button.className = "zotero-tb-button";
-  button.setAttribute("tooltiptext", "Chat");
-  button.setAttribute("aria-label", "Chat");
+  const chat = startupWord("chat", prefs.json<{ uiLanguage?: string }>("settings", {}).uiLanguage, Zotero.locale);
+  button.setAttribute("tooltiptext", chat);
+  button.setAttribute("aria-label", chat);
   button.style.cssText = `-moz-context-properties: stroke; stroke: currentColor; list-style-image: url("${ICON}");`;
   toolbar?.insertBefore(button, doc.getElementById("zotero-tb-tabs-menu")?.nextSibling ?? null);
 
@@ -104,7 +109,12 @@ export function injectPanel(win: any, load: (shadow: ShadowRoot) => Panel, prefs
     if (open) button.setAttribute("open", "true"); else button.removeAttribute("open");
     button.setAttribute("aria-pressed", String(open));
   };
-  const set = (v: boolean) => { open = v; apply(); if (v) ensure().api.focusComposer(); };
+  const set = (v: boolean) => {
+    open = v;
+    apply();
+    panelApi?.setVisible(v); // closed, the panel watches nothing (context.ts); it catches up when shown
+    if (v) ensure().api.focusComposer();
+  };
   button.addEventListener("command", () => set(!open));
   apply();
   // Set to open at start: load once Zotero is idle, so its own startup is not delayed.

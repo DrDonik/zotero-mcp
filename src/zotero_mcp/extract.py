@@ -25,7 +25,8 @@ import os
 import re
 import sys
 import threading
-from collections import OrderedDict
+import unicodedata
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -211,6 +212,71 @@ def _extract_pdf_reused(
     )
 
 
+#: Largest re-saved PDF kept for the calls that follow on the same file.
+_REPAIR_MEMO_MAX_BYTES = 64 * 1024 * 1024
+_repair_memo: dict[_ParseKey, bytes] = {}
+
+
+def _repaired_pdf(path: str) -> bytes | None:
+    """The PDF re-saved by PyMuPDF, for a file pdf-inspector cannot parse.
+
+    pdf-inspector reads a file's cross-reference table as written and gives
+    up with "Invalid PDF structure" when it is damaged (a wrong ``startxref``,
+    offsets that are off, bytes before the header), which is how some
+    producers write every file (#563). PyMuPDF rebuilds the table, so its
+    copy of the file parses. None when PyMuPDF is not installed or cannot
+    open the file either. The last copy is kept, since a read asks for the
+    page count and then for the pages.
+    """
+    key = _parse_key(path)
+    with _memo_lock:
+        if key in _repair_memo:
+            return _repair_memo[key]
+    try:
+        import pymupdf
+    except ImportError:
+        try:
+            import fitz as pymupdf  # PyMuPDF 1.24.2
+        except ImportError:
+            return None
+    try:
+        with pymupdf.open(path) as pdf:
+            if not pdf.is_pdf or pdf.needs_pass or not pdf.page_count:
+                return None
+            data = pdf.tobytes(garbage=3, clean=True, deflate=True)
+    except Exception as exc:
+        logger.debug("PyMuPDF could not re-save %s: %s", path, exc)
+        return None
+    if key is not None and len(data) <= _REPAIR_MEMO_MAX_BYTES:
+        with _memo_lock:
+            _repair_memo.clear()
+            _repair_memo[key] = data
+    return data
+
+
+def _inspect(function: str, path: str, **kwargs):
+    """Call a pdf-inspector function on a file, or on PyMuPDF's repaired copy of it.
+
+    The copy is only made when pdf-inspector rejects the file as it is, and
+    the original error is raised when there is no copy or it fails too.
+    """
+    pdf_inspector = _pdf_inspector()
+    try:
+        return getattr(pdf_inspector, function)(path, **kwargs)
+    except ValueError:
+        repaired = _repaired_pdf(path)
+        if repaired is None:
+            raise
+        try:
+            result = getattr(pdf_inspector, function + "_bytes")(repaired, **kwargs)
+        except Exception:
+            result = None
+        if result is None:
+            raise
+        logger.info("pdf-inspector could not parse %s as written; read PyMuPDF's re-saved copy", path)
+        return result
+
+
 def pdf_page_count(file_path: str | Path) -> int:
     """Return the number of pages in a PDF.
 
@@ -225,7 +291,83 @@ def pdf_page_count(file_path: str | Path) -> int:
     memoized = _memo_get(_parse_key(str(file_path)))
     if memoized is not None:
         return memoized.page_count
-    return _pdf_inspector().classify_pdf(str(file_path)).page_count
+    return _inspect("classify_pdf", str(file_path)).page_count
+
+
+#: Visible words on a page above which it is not checked for a hidden OCR layer.
+_OCR_RECOVERY_MAX_WORDS = 150
+
+
+def _recover_ocr_pages(
+    path: str,
+    page_numbers: tuple[int, ...],
+    markdown_pages: list[str],
+) -> tuple[list[str], set[int]]:
+    """Recover missing OCR text only on scan-like pages with short Markdown.
+
+    Short means under ``_OCR_RECOVERY_MAX_WORDS``: a scan's visible text is a
+    download stamp, often with a running head and a footer. Scan-like means
+    page images that together cover most of the page; scanners also store a
+    page as a few horizontal strips, none of which is the page by itself.
+    """
+    candidates = [
+        index for index, text in enumerate(markdown_pages) if len(text.split()) < _OCR_RECOVERY_MAX_WORDS
+    ]
+    if not candidates:
+        return markdown_pages, set()
+    try:
+        import pymupdf
+    except ImportError:
+        try:
+            import fitz as pymupdf  # PyMuPDF 1.24.2
+        except ImportError:
+            return markdown_pages, set()
+
+    def words(text: str) -> Counter:
+        return Counter(re.findall(r"\w+", unicodedata.normalize("NFC", text).casefold()))
+
+    out = list(markdown_pages)
+    recovered: set[int] = set()
+    try:
+        with pymupdf.open(path) as pdf:
+            for index in candidates:
+                number = page_numbers[index]
+                try:
+                    page = pdf[number]
+                    area = page.rect.get_area()
+                    if not area or sum(
+                        (pymupdf.Rect(image["bbox"]) & page.rect).get_area()
+                        for image in page.get_image_info()
+                    ) < area * 0.8:
+                        continue
+                    hidden = "".join(
+                        chr(char[0]) for span in page.get_texttrace() if span["type"] == 3 for char in span["chars"]
+                    )
+                    hidden_words = words(hidden)
+                    primary_words = words(markdown_pages[index])
+                    if not hidden_words or not (hidden_words - primary_words):
+                        continue
+                    # A second multiword transcription would duplicate a short body.
+                    # Preserve Markdown; single unspaced/fragmented layers are exempt.
+                    if 1 < sum(hidden_words.values()) <= sum(primary_words.values()):
+                        continue
+                    # PyMuPDF already reads both the hidden layer and visible stamps.
+                    text = page.get_text().replace(PAGE_SEPARATOR, "\n").strip()
+                    if (
+                        not text
+                        or "\ufffd" in text
+                        or any(unicodedata.category(char) == "Cc" and char not in "\n\r\t" for char in text)
+                    ):
+                        continue
+                    out[index] = (
+                        "*[Plain text from the PDF's OCR layer; layout and headings are not preserved.]*\n\n" + text
+                    )
+                    recovered.add(number)
+                except Exception as exc:
+                    logger.warning("OCR text-layer recovery failed on page %s of %s: %s", number, path, exc)
+    except Exception as exc:
+        logger.debug("OCR text-layer recovery unavailable for %s: %s", path, exc)
+    return out, recovered
 
 
 def extract_pdf(
@@ -288,7 +430,7 @@ def extract_pdf(
     can_fall_back = pages is None or len(set(wanted)) == total
 
     try:
-        result = pdf_inspector.extract_pages_markdown(path, pages=wanted)
+        result = _inspect("extract_pages_markdown", path, pages=wanted)
     except Exception as exc:
         # Some producers (Ghostscript / PDFCreator) emit content streams the
         # markdown pass rejects while the plain-text pass reads them (#611).
@@ -306,14 +448,17 @@ def extract_pdf(
     if total is None:
         total = len(result.pages)
 
+    page_numbers = tuple(page.page for page in result.pages)
+    markdown_pages, recovered = _recover_ocr_pages(
+        path,
+        page_numbers,
+        [page.markdown or "" for page in result.pages],
+    )
+
     # Scanner OCR layers (invisible text over a page image, as written by
     # Xerox/ABBYY devices) come back as empty markdown with needs_ocr on every
     # page, although the plain-text pass returns that layer (#611).
-    if (
-        can_fall_back
-        and result.pages
-        and not any((page.markdown or "").strip() for page in result.pages)
-    ):
+    if can_fall_back and result.pages and not any(markdown.strip() for markdown in markdown_pages):
         fallback = _text_layer_fallback(
             pdf_inspector, path, wanted=wanted, total=total, truncated=truncated,
         )
@@ -321,14 +466,14 @@ def extract_pdf(
             return fallback
 
     return _doc_from_pages(
-        [page.markdown or "" for page in result.pages],
+        markdown_pages,
         page_count=total,
         source="pdf",
         # Read page indices off the page objects rather than
         # ``pages_needing_ocr``: these stay absolute when a subset was
         # requested, so they remain comparable to ``page_numbers``.
-        page_numbers=tuple(page.page for page in result.pages),
-        needs_ocr=tuple(page.page for page in result.pages if page.needs_ocr),
+        page_numbers=page_numbers,
+        needs_ocr=tuple(page.page for page in result.pages if page.needs_ocr and page.page not in recovered),
         truncated=truncated,
     )
 

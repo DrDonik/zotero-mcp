@@ -26,5 +26,31 @@ async function main(ctx) {
   injected.hide(); injected.show();
   out.reopenMs = Date.now() - t1;
   check(out.reopenMs < 30, `reopen took ${out.reopenMs} ms (budget 30)`);
+
+  // Closed again, the panel watches nothing in Zotero: its one timer (the reader's page and selection) is stopped, and
+  // runs again when it is shown.
+  const tracker = injected.loaded().bundle.context;
+  check(tracker.timer !== null, "an open panel watches the reader");
+  injected.hide();
+  check(tracker.timer === null, "a closed panel keeps no timer");
+  let told = 0;
+  const off = tracker.on(() => { told++; });
+  tracker.refresh();
+  check(told === 0, "a closed panel is told of no change");
+  injected.show();
+  check(told >= 1 && tracker.timer !== null, "shown again, it catches up and watches again");
+  off();
+
+  // panel.js ships UTF-8 (esbuild charset "utf8"), not \u escapes: Gecko's script loader must decode it as UTF-8.
+  const PREF = "extensions.zotero-chat.settings";
+  const saved = Zotero.Prefs.get(PREF, true) || "{}";
+  const ta = () => win.document.getElementById("zmc-root")?.shadowRoot?.querySelector("textarea");
+  try {
+    Zotero.Prefs.set(PREF, JSON.stringify({ ...JSON.parse(saved), uiLanguage: "zh-Hans" }), true);
+    await ctx.waitFor(() => ta()?.placeholder === "\u8be2\u95ee\u60a8\u7684\u6587\u732e\u5e93\u2026", "the panel speaks Simplified Chinese, decoded as UTF-8");
+    out.zhPlaceholder = ta().placeholder;
+  } finally {
+    Zotero.Prefs.set(PREF, saved, true);
+  }
   return out;
 }

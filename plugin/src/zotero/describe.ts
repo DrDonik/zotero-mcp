@@ -3,6 +3,8 @@ import type { ContextChip, ZoteroRef } from "../types.ts";
 import { CONTEXT_TAG } from "../agent/index.ts";
 import { repeatLine } from "../ui/economy.ts";
 
+/** The block's own tag, opening or closing, however it is spelled. */
+const TAG = new RegExp(`<\\s*/?\\s*${CONTEXT_TAG}\\b(?:[^>\\n]{0,80}>)?`, "gi");
 const libLabel = (ref: ZoteroRef) => (ref.libraryID === Zotero.Libraries.userLibraryID ? "" : ` · group library ${Zotero.Libraries.get(ref.libraryID).groupID}`);
 const page = (ref: ZoteroRef) => (ref.pageLabel ? `p.${ref.pageLabel}` : ref.pageIndex != null ? `p.${ref.pageIndex + 1}` : "");
 const quote = (s: string) => `"${s.replace(/\s+/g, " ").trim().slice(0, 1500)}"`;
@@ -43,9 +45,12 @@ export function describeContext(chips: ContextChip[]): { text: string; images: {
       case "image":
         if (c.image) { focus.push(`- a picture they pasted (${c.label}): the image is attached`); images.push(c.image); }
         break;
-      case "annotation":
-        focus.push(`- ${c.label.split(" · ")[0]} annotation ${c.ref.annotationKey}${page(c.ref) ? ` (${page(c.ref)})` : ""}: ${quote(c.text ?? "")}`);
+      case "annotation": {
+        // the agent reads Zotero's own type ("highlight"), not the chip's label in the user's language
+        const type = (c.ref.annotationKey && Zotero.Items.getByLibraryAndKey(c.ref.libraryID, c.ref.annotationKey)?.annotationType) || c.label.split(" · ")[0];
+        focus.push(`- ${type} annotation ${c.ref.annotationKey}${page(c.ref) ? ` (${page(c.ref)})` : ""}: ${quote(c.text ?? "")}`);
         break;
+      }
       case "paper": // metadata, or the full text's file: already worded (paper.ts)
         if (c.text) lines.push(c.text);
         break;
@@ -63,6 +68,9 @@ export function describeContext(chips: ContextChip[]): { text: string; images: {
   if (focus.length) lines.push("You are pointing at:", ...focus);
   const again = repeatLine(chips);
   if (again) lines.push(again);
-  const text = lines.length ? `<${CONTEXT_TAG}>\n${lines.join("\n")}\n</${CONTEXT_TAG}>` : "";
+  // Titles, abstracts, selections and annotations are the documents' words, not ours: one that writes the block's own tag
+  // must not be able to end the block and go on as if it were the user's message.
+  const body = lines.join("\n").replace(TAG, "");
+  const text = lines.length ? `<${CONTEXT_TAG}>\n${body}\n</${CONTEXT_TAG}>` : "";
   return { text, images };
 }

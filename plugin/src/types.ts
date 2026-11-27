@@ -82,12 +82,23 @@ export type ChatEvent =
   | { t: "plan"; turn: string; entries: { content: string; status: "pending" | "in_progress" | "completed" }[] }
   | { t: "permission"; turn: string; id: string; title: string; kind: ToolKind; input?: unknown; options: PermissionOption[]; resolved?: string; name?: string }
   | { t: "turn_end"; turn: string; stop: "end_turn" | "cancelled" | "max_tokens" | "refusal" | "error"; usage?: Usage }
+  | { t: "session_title"; /** The agent's own name for this conversation (ACP `session_info_update`), whenever it arrives. */ title: string }
   | { t: "notice"; level: "info" | "warn" | "error"; message: string; hint?: string; /** The agent summarised older turns: what was sent before may be gone. */ compacted?: boolean;
       /** The context window's fill right after a compaction the user asked for (no turn_end carries it). */ context?: { used: number; size: number } };
 
 // ───────────────────────────── agent/ ─────────────────────────────
 
-export type BackendId = "claude-code" | "codex" | "pi";
+export type BuiltinBackendId = "claude-code" | "codex" | "pi" | "opencode";
+export type BackendId = BuiltinBackendId | "custom";
+export type BackendValues<T> = Record<BuiltinBackendId, T> & Partial<Record<"custom", T>>;
+
+/** A user-installed stdio ACP agent. Arguments are literal argv entries, never a shell command. */
+export interface CustomAgentConfig {
+  label: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
 
 export interface ModelOption { id: string; name: string; description?: string }
 export interface ModeOption { id: string; name: string; description?: string }
@@ -189,6 +200,8 @@ export interface AgentRuntime {
   start(opts: StartOpts): Promise<AgentSession>;
   /** The backend's models, modes and efforts. Cached after the first call (which starts a short-lived bridge). */
   catalog(backend: BackendId): Promise<Catalog>;
+  /** The catalog if it is known without starting anything (a session said it, this run or an earlier one); undefined otherwise. */
+  cached?(backend: BackendId): Promise<Catalog | undefined>;
 }
 
 // ─────────────────── process spawning (injected into agent/) ───────────────────
@@ -278,12 +291,13 @@ export interface SkillHost {
 
 export interface PanelSettings {
   backend: BackendId;
+  customAgent?: CustomAgentConfig;
   /** Per backend; "" means the backend's own default. Ids are the backend's, so they are never shared between backends. */
-  model: Record<BackendId, string>;
-  mode: Record<BackendId, string>;
-  effort: Record<BackendId, string>;
+  model: BackendValues<string>;
+  mode: BackendValues<string>;
+  effort: BackendValues<string>;
   /** Per backend: run on the user's subscription (bridge login) or on an API key kept in the OS keychain. */
-  auth: Record<BackendId, "subscription" | "api-key">;
+  auth: BackendValues<"subscription" | "api-key">;
   prompts: PromptEntry[];
   /** Per skill name: its pin slot (shared with the prompts' slots) and whether it is turned off. */
   skills?: Record<string, { slot?: number; off?: boolean }>;
@@ -308,6 +322,10 @@ export interface PanelSettings {
   openAtStart: boolean;
   /** The first-run welcome (agent choice and setup check) has been finished or skipped. */
   welcomed: boolean;
+  /** true: sending scrolls the feed to the newest message. false: the feed holds the reader's position (a reader at the bottom still follows the stream). */
+  scrollOnSend: boolean;
+  /** How a new chat is first named: the agent's own summary (falling back to the focused paper, then the question), the paper focused at the first question, or the question text. Snapshotted onto each chat when it is named. */
+  titleSource: "agent" | "paper" | "question";
   /** Where new chats run: the agent's working directory, and where the zotero-cli skill is installed. "" = the default folder. */
   chatFolder: string;
 
@@ -317,7 +335,9 @@ export interface PanelSettings {
   /** The target language's id (ui/settings-model.ts LANGUAGES); the default follows Zotero's own language. */
   translateTo: string;
   /** Per backend: the translator's model; "" = the fastest one the backend offers. */
-  translateModel: Record<BackendId, string>;
+  translateModel: BackendValues<string>;
+  /** The panel's own language (src/locales/languages.ts UI_LANGUAGES); "" follows Zotero's. */
+  uiLanguage: string;
   appearance: Appearance;
 }
 
@@ -342,6 +362,10 @@ export interface Appearance {
 export interface SavedSession {
   id: string;
   title: string;
+  /** The naming scheme this chat started under (the setting, snapshotted at its first message). Absent on chats saved before it existed: those behave as "agent". */
+  titleSource?: "agent" | "paper" | "question";
+  /** Set by a user rename: no automatic source ever changes the title again. */
+  titleLocked?: boolean;
   backend: BackendId;
   /** The folder the chat ran in. Agents find a session by its folder, so resuming (here or in a terminal) needs this one, not the current setting. */
   cwd: string;
@@ -392,6 +416,10 @@ export interface PanelHost {
   loadEvents(sessionId: string): Promise<ChatEvent[]>;
   appendEvent(session: SavedSession, ev: ChatEvent): Promise<void>;
   deleteSession(sessionId: string): Promise<void>;
+  /** A user rename: sets the title and locks it against every automatic source. */
+  renameSession(sessionId: string, title: string): Promise<void>;
+  /** The title of the paper the chips point at (the reader's, else the first item's), clipped for display; null when they name no item. */
+  paperTitle(chips: ContextChip[]): string | null;
 
   /** Delete every saved chat. */
   clearHistory(): Promise<void>;
@@ -403,8 +431,8 @@ export interface PanelHost {
   about(): { version: string; workspace: string };
 
   doctor(): Promise<DoctorCheck[]>;
-  /** The brief and folder for an agent session (the host knows where the CLI and skill are). `cwd` resumes a saved chat in the folder it ran in; omitted, the chat folder setting is used. */
-  prepareSession(cwd?: string): Promise<{ cwd: string; brief: string; env: Record<string, string> }>;
+  /** The brief and folder for an agent session (the host knows where the CLI and skill are). `cwd` resumes a saved chat in the folder it ran in; omitted, the chat folder setting is used. `backend`: the agent the session is for (its API key), when it is not the chosen one. */
+  prepareSession(cwd?: string, backend?: BackendId): Promise<{ cwd: string; brief: string; env: Record<string, string> }>;
   /** A folder picker; null when cancelled. */
   chooseFolder(start?: string): Promise<string | null>;
   /** Zotero's Save dialog for `data` (a diagram's PNG or SVG); writes the file and returns its path, null when cancelled. */
@@ -418,6 +446,8 @@ export interface PanelHost {
   removeImage(): Promise<void>;
   /** The shell command that continues a saved chat in a terminal, e.g. `cd "…" && claude --resume ID`; null when the backend has none. */
   resumeCommand(session: SavedSession): string | null;
+  /** Zotero's UI locale ("zh-CN"): the panel's language unless the setting names one. */
+  locale(): string;
   /** "light" | "dark", and a callback for when Zotero's theme changes. */
   theme(): "light" | "dark";
   onThemeChange(cb: () => void): () => void;
@@ -427,7 +457,7 @@ export interface PanelHost {
 
 /** What the settings screen needs, and all that Zotero's Settings pane provides (zotero/settings-host.ts). */
 export type SettingsHost = Pick<PanelHost, "getSettings" | "setSettings" | "resetSettings" | "setApiKey" | "hasApiKey" | "clearHistory" | "revealWorkspace"
-  | "about" | "chooseFolder" | "chooseImage" | "loadImage" | "removeImage" | "theme" | "onThemeChange" | "onSettingsChange" | "skills"> & { runtime: Pick<AgentRuntime, "detect" | "catalog"> };
+  | "about" | "chooseFolder" | "chooseImage" | "loadImage" | "removeImage" | "locale" | "theme" | "onThemeChange" | "onSettingsChange" | "skills"> & { runtime: Pick<AgentRuntime, "detect" | "catalog" | "cached"> };
 
 /** The only function the UI layer exports to the bootstrap: render into a shadow root, return a disposer. `runPrompt` runs the prompt or skill pinned to that slot. */
 export type MountPanel = (root: ShadowRoot, host: PanelHost) => { dispose(): void; focusComposer(): void; runPrompt(slot: number): void };
