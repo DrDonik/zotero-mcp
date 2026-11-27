@@ -239,7 +239,7 @@ def test_report_reads_every_collection_of_the_index(monkeypatch, capsys):
     import zotero_mcp.check_missing_fulltext as cmf
     import zotero_mcp.chroma_client as cc
 
-    articles = FakeCollection([_article("FFFF6666")])
+    articles = FakeCollection([_article("FFFF6666", chars=50)])
     passages = FakeCollection(_chunks("FFFF6666", 4))
 
     class FakeClient:

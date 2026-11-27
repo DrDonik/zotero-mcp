@@ -7,6 +7,8 @@ with a few local changes: the `check-missing-fulltext` command
 
 ## Syncing with upstream
 
+- A fresh clone has only `origin`. Add and fetch upstream first:
+  `git remote add upstream https://github.com/54yyyu/zotero-mcp.git` (skip if it exists), then `git fetch upstream`.
 - Merge `upstream/main` into a branch; never rebase onto it.
 - `docker.yml` and `release.yml` stay deleted (modify/delete conflict on every sync).
 - `cli.py`: keep the `check-missing-fulltext` subparser next to whatever upstream added.
