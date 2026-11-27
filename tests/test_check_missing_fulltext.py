@@ -188,3 +188,107 @@ def test_trashed_items_are_not_reported_as_missing(tmp_path, monkeypatch):
     items = cmf.get_items_with_pdf_attachments()
 
     assert set(items) == {"KEEPME01"}
+
+
+def _article(item_key, chars=4000, **meta):
+    return (item_key, "a" * chars, {"item_key": item_key, "has_fulltext": True, **meta})
+
+
+def test_split_index_counts_passages_from_their_own_collection():
+    """0.17.0 keeps one article record per item and the passages apart."""
+    articles = FakeCollection([_article("AAAA1111"), _article("BBBB2222")])
+    passages = FakeCollection(_chunks("AAAA1111", 5) + _chunks("BBBB2222", 2))
+
+    indexed = aggregate_indexed_items([articles, passages], batch_size=3)
+
+    # The article record is a truncated copy of the same text: not added on top.
+    assert indexed["AAAA1111"]["chunks"] == 5
+    assert indexed["AAAA1111"]["length"] == 5 * 1500
+    assert indexed["BBBB2222"]["chunks"] == 2
+    assert indexed["BBBB2222"]["length"] == 2 * 1500
+
+
+def test_article_record_alone_counts_as_one_document():
+    """Chunking off, or passages not filled in yet: the article record speaks."""
+    indexed = aggregate_indexed_items([FakeCollection([_article("CCCC3333", 2500)])])
+
+    assert indexed["CCCC3333"] == {"length": 2500, "chunks": 1, "has_fulltext": True}
+
+
+def test_failed_marker_on_the_article_record_is_reported_in_a_split_index():
+    articles = FakeCollection([_article("DDDD4444", 300, has_fulltext="failed")])
+    passages = FakeCollection([])
+    pdf_items = {"DDDD4444": {"item_key": "DDDD4444", "title": "T", "author": "A", "date": "D"}}
+
+    failures = find_missing_fulltext(pdf_items, aggregate_indexed_items([articles, passages]))
+
+    assert [f["reason"] for f in failures] == ["Extraction previously failed (marked in index)"]
+
+
+def test_unmigrated_chunked_index_is_read_like_before():
+    """Passages still in the article collection, next to article records."""
+    mixed = FakeCollection([_article("EEEE5555")] + _chunks("EEEE5555", 3))
+
+    indexed = aggregate_indexed_items(mixed)
+
+    assert indexed["EEEE5555"]["chunks"] == 3
+    assert indexed["EEEE5555"]["length"] == 3 * 1500
+
+
+def test_report_reads_every_collection_of_the_index(monkeypatch, capsys):
+    import zotero_mcp.check_missing_fulltext as cmf
+    import zotero_mcp.chroma_client as cc
+
+    articles = FakeCollection([_article("FFFF6666", chars=50)])
+    passages = FakeCollection(_chunks("FFFF6666", 4))
+
+    class FakeClient:
+        collection = articles
+
+        def collections(self):
+            return [articles, passages]
+
+    monkeypatch.setattr(cmf, "get_items_with_pdf_attachments", lambda: {
+        "FFFF6666": {"item_key": "FFFF6666", "title": "T", "author": "A", "date": "D"},
+    })
+    monkeypatch.setattr(cc, "create_chroma_client", lambda config_path=None: FakeClient())
+
+    cmf.check_chromadb_fulltext(output_format="json")
+
+    assert "Found 0 items with extraction failures" in capsys.readouterr().err
+
+
+def test_real_split_index_is_aggregated_across_both_collections(tmp_path):
+    """On a real persistent index with a separate passage collection (0.17.0)."""
+    import importlib.util
+    import sys
+
+    import pytest
+
+    if sys.version_info >= (3, 14) or importlib.util.find_spec("chromadb") is None:
+        pytest.skip("needs chromadb on Python < 3.14")
+
+    from zotero_mcp.chroma_client import ChromaClient
+
+    client = ChromaClient(collection_name="cmf_test", persist_directory=str(tmp_path / "chroma"))
+    client.route_passages = True
+    ids = ["GGGG7777", "GGGG7777#0", "GGGG7777#1", "HHHH8888"]
+    docs = ["article " * 50, "p" * 1200, "q" * 800, ""]
+    metas = [
+        {"item_key": "GGGG7777", "has_fulltext": True},
+        {"item_key": "GGGG7777", "parent_item_key": "GGGG7777", "chunk_index": 0,
+         "n_chunks": 2, "has_fulltext": True},
+        {"item_key": "GGGG7777", "parent_item_key": "GGGG7777", "chunk_index": 1,
+         "n_chunks": 2, "has_fulltext": True},
+        {"item_key": "HHHH8888", "has_fulltext": "failed"},
+    ]
+    client.upsert_embeddings(documents=docs, metadatas=metas, ids=ids,
+                             embeddings=[[1.0, 0.0] for _ in ids])
+
+    collections = client.collections()
+    assert len(collections) == 2  # the passages really went to their own collection
+
+    indexed = aggregate_indexed_items(collections)
+
+    assert indexed["GGGG7777"] == {"length": 2000, "chunks": 2, "has_fulltext": True}
+    assert indexed["HHHH8888"]["has_fulltext"] == "failed"
