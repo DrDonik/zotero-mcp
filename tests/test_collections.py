@@ -62,6 +62,12 @@ class FakeZoteroCollections(FakeZotero):
         return [c for c in self._collections if c["data"].get("parentCollection") == key]
 
 
+def _written(zot):
+    """{item key: collections} as written back by zotero_set_item_collections,
+    which sends each item once with its final membership."""
+    return {it["key"]: it["data"]["collections"] for it in zot.updated}
+
+
 class _FakeResponse:
     """Minimal httpx.Response stub."""
 
@@ -357,9 +363,7 @@ class TestManageCollections:
             ctx=ctx,
         )
 
-        assert len(fake_zot.added_to_collections) == 1
-        coll_key, items = fake_zot.added_to_collections[0]
-        assert coll_key == "ABC00003"
+        assert _written(fake_zot) == {"ITEM0001": ["ABC00001", "ABC00003"]}
         assert "success" in result.lower() or "added" in result.lower()
 
     def test_remove_items_from_collection(self, monkeypatch, fake_zot, ctx):
@@ -372,9 +376,7 @@ class TestManageCollections:
             ctx=ctx,
         )
 
-        assert len(fake_zot.removed_from_collections) == 1
-        coll_key, item = fake_zot.removed_from_collections[0]
-        assert coll_key == "ABC00003"
+        assert _written(fake_zot) == {"ITEM0002": []}
         assert "success" in result.lower() or "removed" in result.lower()
 
     def test_add_and_remove_in_one_call(self, monkeypatch, fake_zot, ctx):
@@ -388,8 +390,8 @@ class TestManageCollections:
             ctx=ctx,
         )
 
-        assert len(fake_zot.added_to_collections) >= 1
-        assert len(fake_zot.removed_from_collections) >= 1
+        assert _written(fake_zot) == {"ITEM0001": ["ABC00003"]}
+        assert len(fake_zot.updated) == 1  # one write carries both changes
         assert "success" in result.lower() or "added" in result.lower()
 
     def test_item_keys_as_json_string(self, monkeypatch, fake_zot, ctx):
@@ -403,7 +405,8 @@ class TestManageCollections:
         )
 
         # Should process both items
-        assert len(fake_zot.added_to_collections) >= 1
+        assert _written(fake_zot) == {"ITEM0001": ["ABC00001", "ABC00002"],
+                                      "ITEM0002": ["ABC00003", "ABC00002"]}
         assert "success" in result.lower() or "added" in result.lower()
 
     def test_add_to_as_json_string(self, monkeypatch, fake_zot, ctx):
@@ -416,7 +419,7 @@ class TestManageCollections:
             ctx=ctx,
         )
 
-        assert len(fake_zot.added_to_collections) >= 2
+        assert _written(fake_zot) == {"ITEM0001": ["ABC00001", "ABC00002", "ABC00003"]}
 
     def test_remove_from_as_json_string(self, monkeypatch, fake_zot, ctx):
         """remove_from passed as a JSON string should be normalized."""
@@ -428,7 +431,7 @@ class TestManageCollections:
             ctx=ctx,
         )
 
-        assert len(fake_zot.removed_from_collections) >= 1
+        assert _written(fake_zot) == {"ITEM0001": []}
 
     def test_single_string_item_key(self, monkeypatch, fake_zot, ctx):
         """A single item_key string (not a list) should be normalized to a list."""
@@ -440,7 +443,7 @@ class TestManageCollections:
             ctx=ctx,
         )
 
-        assert len(fake_zot.added_to_collections) >= 1
+        assert _written(fake_zot) == {"ITEM0001": ["ABC00001", "ABC00002"]}
 
     def test_hybrid_mode_fetches_from_write_client(self, monkeypatch, ctx):
         """In hybrid mode, items are fetched from write_zot (not read_zot)
@@ -468,7 +471,9 @@ class TestManageCollections:
         )
 
         # Write operations should go through write_zot
-        assert len(write_zot.added_to_collections) >= 1
+        assert _written(write_zot) == {"ITEM0001": ["COL00001"]}
+        assert write_zot.updated[0]["version"] == 99
+        assert read_zot.updated == []
 
     def test_local_only_mode_returns_error(self, monkeypatch, fake_zot, ctx):
         """In local-only mode, return clear error."""
@@ -504,9 +509,7 @@ class TestManageCollections:
             ctx=ctx,
         )
 
-        assert fake_zot.added_to_collections, f"nothing filed: {result}"
-        coll_key, _ = fake_zot.added_to_collections[0]
-        assert coll_key == "ABC00003"
+        assert _written(fake_zot) == {"ITEM0001": ["ABC00001", "ABC00003"]}, result
 
     def test_collection_path_resolution_in_add_to(self, monkeypatch, fake_zot, ctx):
         """A 'parent/child' path disambiguates nested collections."""
@@ -518,9 +521,7 @@ class TestManageCollections:
             ctx=ctx,
         )
 
-        assert fake_zot.added_to_collections, f"nothing filed: {result}"
-        coll_key, _ = fake_zot.added_to_collections[0]
-        assert coll_key == "ABC00002"
+        assert _written(fake_zot) == {"ITEM0001": ["ABC00001", "ABC00002"]}, result
 
     def test_multiple_items_batched(self, monkeypatch, fake_zot, ctx):
         """Multiple items should all be processed."""
@@ -702,3 +703,69 @@ class TestAmbiguousParentCollection:
             collection_key="ABC00003", parent_collection="Course A/Readings", ctx=ctx
         )
         assert twin_readings.updated_collections[0]["parentCollection"] == "READA001"
+
+
+# ===========================================================================
+# zotero_manage_collection (0.16): one tool for create/update/delete
+# ===========================================================================
+
+
+class TestManageCollection:
+    def test_create_dispatches(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.manage_collection(
+            action="create", name="Sub", parent_collection="Machine Learning", ctx=ctx
+        )
+        assert "NEWCOL0000" in result
+        assert fake_zot.created_collections[0]["parentCollection"] == "ABC00001"
+
+    def test_update_dispatches(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.manage_collection(
+            action="update", collection_key="ABC00003", to_top_level=False,
+            name="NLP & Speech", ctx=ctx,
+        )
+        assert "Updated collection" in result
+        assert fake_zot.updated_collections[0]["name"] == "NLP & Speech"
+
+    def test_delete_dispatches(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.manage_collection(action="delete", collection_key="ABC00001", ctx=ctx)
+        assert "Deleted" in result
+        assert fake_zot.deleted_collections[0]["key"] == "ABC00001"
+
+    @pytest.mark.parametrize(
+        "kwargs, needle",
+        [
+            ({"action": "create"}, "requires name"),
+            ({"action": "create", "name": "X", "collection_key": "ABC00001"}, "not collection_key"),
+            ({"action": "update", "name": "X"}, "requires collection_key"),
+            ({"action": "delete"}, "requires collection_key"),
+            ({"action": "delete", "collection_key": "ABC00001", "name": "X"}, "takes only collection_key"),
+        ],
+    )
+    def test_wrong_arguments_change_nothing(self, monkeypatch, fake_zot, ctx, kwargs, needle):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.manage_collection(**kwargs, ctx=ctx)
+        assert needle in result
+        assert not fake_zot.created_collections
+        assert not fake_zot.deleted_collections
+
+
+def test_old_collection_tools_are_legacy_only():
+    import asyncio
+
+    from zotero_mcp.toolsets import TOOLSETS, apply_toolsets
+
+    old = {"zotero_create_collection", "zotero_update_collection", "zotero_delete_collection"}
+    assert old <= TOOLSETS["legacy"]
+    try:
+        apply_toolsets(server.mcp, raw=None, transport="stdio")
+        names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+        assert "zotero_manage_collection" in names
+        assert not old & names
+        apply_toolsets(server.mcp, raw="default,legacy", transport="stdio")
+        names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+        assert old <= names
+    finally:
+        apply_toolsets(server.mcp, raw="all", transport="streamable-http")

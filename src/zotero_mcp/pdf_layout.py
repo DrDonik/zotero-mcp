@@ -379,7 +379,8 @@ def scan_math(page) -> tuple[list[dict], int]:
     boxes: list[list[float]] = []
     numbers: list[tuple[tuple, str]] = []
     inline_math_chars = 0
-    for block in page.get_text("dict", flags=0)["blocks"]:
+    # 128 = TEXT_CID_FOR_UNKNOWN_UNICODE: without it a font with no Unicode map reads as U+FFFD.
+    for block in page.get_text("dict", flags=128)["blocks"]:
         body = None
         total = mathy = real_math = 0
         for line in block.get("lines", []):
@@ -553,7 +554,7 @@ def _absorb_uncaptioned_panels(
     return [region for idx, region in enumerate(result) if idx not in absorbed]
 
 
-def detect_page_regions(pdf, page_num: int) -> dict:
+def detect_page_regions(pdf, page_num: int, panels: bool = False) -> dict:
     """
     Detect candidate figure/table regions on a PDF page.
 
@@ -569,6 +570,8 @@ def detect_page_regions(pdf, page_num: int) -> dict:
     Args:
         pdf: Path to the PDF file, or an open PyMuPDF document
         page_num: 1-indexed page number
+        panels: also split figures into panels at their panel letters
+            (A, B, C ...); each panel is a region with ``source`` "panel"
 
     Returns:
         On success:
@@ -593,10 +596,10 @@ def detect_page_regions(pdf, page_num: int) -> dict:
             {"error": str}
     """
     if not isinstance(pdf, (str, os.PathLike)):
-        return _page_regions(pdf, page_num)
+        return _page_regions(pdf, page_num, panels)
 
     try:
-        import fitz
+        from zotero_mcp._pymupdf import fitz
     except ImportError:
         raise ImportError(
             f"PDF layout detection requires PyMuPDF. {install_hint('pdf')}"
@@ -606,12 +609,12 @@ def detect_page_regions(pdf, page_num: int) -> dict:
     except Exception as e:
         return {"error": f"Could not open PDF: {e}"}
     try:
-        return _page_regions(doc, page_num)
+        return _page_regions(doc, page_num, panels)
     finally:
         doc.close()
 
 
-def _page_regions(doc, page_num: int) -> dict:
+def _page_regions(doc, page_num: int, panels: bool = False) -> dict:
     """detect_page_regions on an open document."""
     if not doc.is_pdf:
         return {"error": "File is not a valid PDF"}
@@ -627,8 +630,17 @@ def _page_regions(doc, page_num: int) -> dict:
     if page_width <= 0 or page_height <= 0:
         return {"error": f"Page {page_num} has invalid dimensions"}
 
-    def normalize_bbox(x0: float, y0: float, x1: float, y1: float) -> list[float]:
-        """Convert page coordinates to clamped normalized [x, y, w, h]."""
+    def normalize_bbox(x0: float, y0: float, x1: float, y1: float, shown: bool = False) -> list[float]:
+        """Convert page coordinates to clamped normalized [x, y, w, h].
+
+        PyMuPDF reports text, images and drawings in the page's unrotated
+        frame, and those are turned to the page as displayed first. Without
+        that a box on a page with /Rotate was measured against the wrong
+        sides and described a different part of the page. ``shown`` is for
+        the one source already in the displayed frame, find_tables().
+        """
+        if not shown:
+            x0, y0, x1, y1 = _shown_points(page, (x0, y0, x1, y1))
         x = min(max(x0 / page_width, 0.0), 1.0)
         y = min(max(y0 / page_height, 0.0), 1.0)
         w = min(max((x1 - x0) / page_width, 0.0), 1.0 - x)
@@ -637,6 +649,8 @@ def _page_regions(doc, page_num: int) -> dict:
 
     warnings: list[str] = []
     raw_regions: list[dict] = []
+    rotated = bool(getattr(page, "rotation", 0) % 360)
+    words: list = []
 
     # --- Raster images ---
     try:
@@ -648,10 +662,18 @@ def _page_regions(doc, page_num: int) -> dict:
     except Exception:
         pass
 
+    # A page's drawings are read once and handed to everything below that
+    # works on them. A dense plot has tens of thousands of paths, and reading
+    # them was most of the time this function took, three times over.
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        drawings = []
+
     # --- Vector graphics (clustered) ---
     if hasattr(page, "cluster_drawings"):
         try:
-            for rect in page.cluster_drawings():
+            for rect in _cluster_drawings(page, drawings):
                 raw_regions.append(
                     {
                         "source": "drawing",
@@ -667,15 +689,17 @@ def _page_regions(doc, page_num: int) -> dict:
         )
 
     # --- Tables ---
-    try:
-        drawings = page.get_drawings()
-    except Exception:
-        drawings = []
+    # Rules and rows are judged on the page as displayed: on a turned page a
+    # table's horizontal rules are vertical strokes in the unrotated frame.
+    shown_rects = [
+        {"rect": drawing["rect"] * page.rotation_matrix}
+        for drawing in drawings if drawing.get("rect") is not None
+    ] if rotated else drawings
     # find_tables() is the slowest step here and finds only grids, which
     # need vertical strokes. A page whose drawings are all horizontal
     # rules (or that has none) cannot hold one, so it skips the call; its
     # rule-only tables are found below.
-    if any(drawing["rect"].height > 2 for drawing in drawings):
+    if any(drawing["rect"].height > 2 for drawing in shown_rects):
         try:
             # PyMuPDF prints an advert for pymupdf_layout to stdout on its
             # first find_tables() call, which corrupts `zotero-cli --json`.
@@ -686,27 +710,31 @@ def _page_regions(doc, page_num: int) -> dict:
                 found_tables = page.find_tables().tables
             for table in found_tables:
                 x0, y0, x1, y1 = table.bbox
+                # find_tables() works on a derotated copy of a turned page,
+                # so its boxes are already those of the page as displayed.
                 raw_regions.append(
-                    {"source": "table", "bbox": normalize_bbox(x0, y0, x1, y1)}
+                    {"source": "table", "bbox": normalize_bbox(x0, y0, x1, y1, shown=True)}
                 )
         except Exception:
             pass
 
     # --- Tables drawn with horizontal rules only (find_tables misses these) ---
     try:
-        ruled = _ruled_table_boxes(drawings, page_width, page_height)
-        words = page.get_text("words") if ruled else []
+        ruled = _ruled_table_boxes(shown_rects, page_width, page_height)
+        if ruled or panels:
+            words = page.get_text("words")
+        shown_words = [_shown_points(page, w[:4]) for w in words] if ruled else []
         for x0, y0, x1, y1 in ruled:
             # Rules around a single line are a heading band (an
             # algorithm's title bar, say), not a table.
             rows = {
                 round((w[1] + w[3]) / 6)
-                for w in words
+                for w in shown_words
                 if x0 - 2 <= w[0] and w[2] <= x1 + 2 and y0 < (w[1] + w[3]) / 2 < y1
             }
             if len(rows) >= LAYOUT_RULE_MIN_ROWS:
                 raw_regions.append(
-                    {"source": "table", "bbox": normalize_bbox(x0, y0, x1, y1)}
+                    {"source": "table", "bbox": normalize_bbox(x0, y0, x1, y1, shown=True)}
                 )
     except Exception:
         pass
@@ -781,6 +809,9 @@ def _page_regions(doc, page_num: int) -> dict:
             "caption_text": label,
             "confidence": "high" if equation["label"] else "medium",
         })
+    if panels:
+        regions.extend(panel_regions(page, regions, drawings=drawings, words=words or None,
+                                     captions=captions))
     regions.sort(key=lambda r: (r["bbox"][1], r["bbox"][0]))
 
     for idx, region in enumerate(regions, start=1):
@@ -793,3 +824,325 @@ def _page_regions(doc, page_num: int) -> dict:
         "regions": regions,
         "warnings": warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# Panels, from the single letters that label them
+# ---------------------------------------------------------------------------
+
+_PANEL_ROW_TOLERANCE = 0.02       # letters this close in y share a row
+_PANEL_LETTER_SIZE = (6.0, 16.0)  # a panel letter is a ~9pt bold span
+_PANEL_FIGURE_REACH = 0.03        # a figure region this near a letter belongs to its figure
+_BOLD_FLAG = 16                   # PyMuPDF span flag
+_PANEL_MARGIN = 0.02              # page margin when no figure region gives the edges
+_PANEL_MIN_SIZE = 0.03            # a panel is at least this wide and tall
+_PANEL_MAX_HEIGHT = 0.6           # and no taller than this (a full-width row may be wider)
+_PANEL_LEFT_REACH = 0.02          # ink this far left of or above a letter still belongs to it
+_PANEL_COLUMN = 0.1               # a lower letter this near in x starts the next panel down
+_PANEL_SPILL = 0.03               # ink past a cell's edge by more than this is cut through
+
+
+def _shown_points(page, bbox) -> tuple[float, float, float, float]:
+    """A PyMuPDF page-space box -> ``(x0, y0, x1, y1)`` in points on the page as displayed."""
+    x0, y0, x1, y1 = bbox
+    if getattr(page, "rotation", 0) % 360:
+        a, b, c, d, e, f = tuple(page.rotation_matrix)
+        xs = (a * x0 + c * y0 + e, a * x1 + c * y1 + e)
+        ys = (b * x0 + d * y0 + f, b * x1 + d * y1 + f)
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    return x0, y0, x1, y1
+
+
+def _shown_box(page, bbox) -> list[float]:
+    """A PyMuPDF page-space box -> ``[x0, y0, x1, y1]`` normalized to the page as displayed."""
+    x0, y0, x1, y1 = _shown_points(page, bbox)
+    width, height = page.rect.width, page.rect.height
+    return [x0 / width, y0 / height, x1 / width, y1 / height]
+
+
+def _cluster_drawings(page, drawings: list) -> list:
+    """page.cluster_drawings() on drawings already read, where PyMuPDF takes them.
+
+    On a turned page the clip is given: PyMuPDF's default is the page as
+    displayed, while the drawings are in the unrotated frame, so everything
+    beyond the shorter side was left out.
+    """
+    clip = {"clip": page.rect * page.derotation_matrix} if getattr(page, "rotation", 0) % 360 else {}
+    try:
+        return page.cluster_drawings(drawings=drawings, **clip)
+    except TypeError:  # a PyMuPDF whose cluster_drawings reads them itself
+        return page.cluster_drawings(**clip)
+
+
+def panel_letters(page) -> list[dict]:
+    """Single bold letters standing alone on a line, the way Cell and Nature label panels.
+
+    Returns ``{"letter", "box"}`` with ``box`` as ``[x0, y0, x1, y1]`` normalized
+    to the page as displayed.
+    """
+    letters = []
+    low, high = _PANEL_LETTER_SIZE
+    for block in page.get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+            spans = [span for span in line["spans"] if span["text"].strip()]
+            if len(spans) != 1:
+                continue
+            span = spans[0]
+            text = span["text"].strip()
+            bold = span["flags"] & _BOLD_FLAG or "bold" in span["font"].lower()
+            if len(text) == 1 and text.isascii() and text.isalpha() and bold and low <= span["size"] <= high:
+                letters.append({"letter": text, "box": _shown_box(page, span["bbox"])})
+    return letters
+
+
+def _ink_boxes(page, drawings: list | None = None, words: list | None = None) -> list[list[float]]:
+    """Drawings, images and words on a page as displayed ``[x0, y0, x1, y1]`` boxes.
+
+    ``drawings`` and ``words`` are the page's, when the caller has read them.
+    """
+    boxes = [word[:4] for word in (page.get_text("words") if words is None else words)]
+    boxes += [info["bbox"] for info in page.get_image_info()]
+    if drawings is None:
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            drawings = []
+    boxes += [tuple(drawing["rect"]) for drawing in drawings if drawing.get("rect") is not None]
+    shown = [_shown_box(page, box) for box in boxes]
+    # A page-sized frame or background is not a panel's ink.
+    return [b for b in shown if (b[2] - b[0]) * (b[3] - b[1]) < LAYOUT_MAX_REGION_AREA]
+
+
+def _centre_in(box, outer) -> bool:
+    x, y = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    return outer[0] <= x <= outer[2] and outer[1] <= y <= outer[3]
+
+
+def panel_regions(page, figure_regions: list[dict], *, drawings: list | None = None,
+                  words: list | None = None, captions: list[dict] | None = None) -> list[dict]:
+    """One region per panel letter on a page, boxed to the ink in its cell.
+
+    The letters cut the figure into cells: a panel runs from its letter to the
+    next letter on its right in its row (or a lower row, for a panel beside
+    it), and down to the next letter in its column or one whose cell spans
+    it, else to the top of the figure caption under it, else to the figure's
+    edge. The cell is then trimmed to the drawings, images and
+    words inside it, and the box never starts more than _PANEL_LEFT_REACH left
+    of or above its letter. Needs two or more letters.
+
+    A box under _PANEL_MIN_SIZE on a side or taller than _PANEL_MAX_HEIGHT is
+    not a panel and is dropped, and so is a letter inside another panel's box
+    or one seen before it in reading order (a label in a bar chart or
+    legend). Confidence is "high" when the letters
+    run A, B, C ... without a gap or repeat and the figure's edges are known
+    from a detected figure region and its caption, "medium" when they run in
+    order but an edge is guessed, and "low" otherwise or when the ink had to
+    be cut at the cell's edge.
+
+    ``figure_regions`` is detect_page_regions' list, ``captions`` the page's
+    caption blocks (``{"bbox": [x, y, w, h]}``). ``drawings`` and ``words``
+    are the page's, when the caller has already read them.
+    """
+    # A letter that comes again further down is a label inside a panel (a bar
+    # chart's "B", a legend's "C"), not a second panel B: keep the first.
+    letters, seen = [], set()
+    for letter in sorted(panel_letters(page), key=lambda m: (m["box"][1], m["box"][0])):
+        if letter["letter"].upper() not in seen:
+            seen.add(letter["letter"].upper())
+            letters.append(letter)
+    if len(letters) < 2:
+        return []
+    marks = sorted(letter["letter"].upper() for letter in letters)
+    in_order = marks[0] == "A" and all(
+        ord(b) - ord(a) == 1 for a, b in zip(marks, marks[1:]))
+    confidence = "high" if in_order else "low"
+
+    reach = _PANEL_FIGURE_REACH
+    near = []
+    for region in figure_regions:
+        if region["source"] not in ("image", "drawing", "merged"):
+            continue
+        x, y, w, h = region["bbox"]
+        if any(x - reach <= m["box"][0] <= x + w + reach and y - reach <= m["box"][1] <= y + h + reach
+               for m in letters):
+            near.append([x, y, x + w, y + h])
+    if near:
+        bounds = [min(b[0] for b in near), min(b[1] for b in near),
+                  max(b[2] for b in near), max(b[3] for b in near)]
+    else:
+        bounds = [_PANEL_MARGIN, _PANEL_MARGIN, 1 - _PANEL_MARGIN, 1 - _PANEL_MARGIN]
+        confidence = "medium" if confidence == "high" else confidence
+    bounds = [min(bounds[0], *(m["box"][0] for m in letters)), min(bounds[1], *(m["box"][1] for m in letters)),
+              max(bounds[2], *(m["box"][2] for m in letters)), max(bounds[3], *(m["box"][3] for m in letters))]
+    caption_tops = [c["bbox"][1] for c in captions or []]
+
+    tolerance = _PANEL_ROW_TOLERANCE
+    ink = _ink_boxes(page, drawings, words)
+
+    def right_of(letter) -> float:
+        lx, ly = letter["box"][0], letter["box"][1]
+        return min([o["box"][0] for o in letters
+                    if o["box"][0] > lx + tolerance and abs(o["box"][1] - ly) < tolerance]
+                   + [bounds[2]])
+
+    regions = []
+    for letter in letters:
+        lx, ly = letter["box"][0], letter["box"][1]
+        right = right_of(letter)
+        # Down to the next letter in this column (starting within
+        # _PANEL_COLUMN of this one, or whose cell spans it), then the caption, then the figure's edge if it lies
+        # below the letter at all.
+        lower = [o for o in letters if o["box"][1] > ly + tolerance]
+        below = [o["box"][1] for o in lower if o["box"][0] <= lx + _PANEL_COLUMN and right_of(o) > lx + tolerance]
+        caption = [top for top in caption_tops if top > ly + _PANEL_MIN_SIZE]
+        edge = bounds[3] if bounds[3] > ly + _PANEL_MIN_SIZE else 1 - _PANEL_MARGIN
+        bottom = min(below + caption + [edge])
+        # A letter lower down and to the right starts a panel beside this one.
+        right = min([right] + [o["box"][0] for o in lower
+                               if o["box"][0] > lx + _PANEL_COLUMN and o["box"][1] < bottom - tolerance])
+        agree = bool(below or caption)
+        # The letter's own word is not the panel's ink: a stray bold letter on a
+        # text page would otherwise come back as a confident letter-sized panel.
+        limits = [lx - _PANEL_LEFT_REACH, ly - _PANEL_LEFT_REACH, right, bottom]
+        inside = [b for b in ink if lx <= (b[0] + b[2]) / 2 <= right and ly <= (b[1] + b[3]) / 2 <= bottom
+                  and not _centre_in(b, letter["box"])
+                  # A backdrop or clip larger than the cell both ways is not its ink.
+                  and not (b[2] - b[0] > right - lx and b[3] - b[1] > bottom - ly)]
+        # Ink spilling well past the cell is cut through: the box leaves it out
+        # and says the panel's edges are a guess.
+        fits = [b for b in inside if max(limits[0] - b[0], limits[1] - b[1],
+                                         b[2] - limits[2], b[3] - limits[3]) <= _PANEL_SPILL]
+        cut = len(fits) < len(inside)
+        if fits:
+            cell = [min(b[0] for b in fits), min(b[1] for b in fits),
+                    max(b[2] for b in fits), max(b[3] for b in fits)]
+        else:
+            cell = [lx, ly, right, bottom]
+        x0 = max(min(cell[0], lx), limits[0], 0.0)
+        y0 = max(min(cell[1], ly), limits[1], 0.0)
+        x1, y1 = min(cell[2], right), min(cell[3], bottom)
+        level = confidence if fits and not cut else "low"
+        if level == "high" and not (near and agree):
+            level = "medium"
+        regions.append({
+            "source": "panel",
+            "bbox": [x0, y0, max(x1 - x0, 0.0), max(y1 - y0, 0.0)],
+            "caption_label": f"Panel {letter['letter']}",
+            "caption_text": f"Panel {letter['letter']}",
+            "confidence": level,
+            "_letter": letter["box"],
+        })
+
+    def holds(region, box) -> bool:
+        x, y, w, h = region["bbox"]
+        return _centre_in(box, [x, y, x + w, y + h])
+
+    kept = []
+    for region in regions:
+        _x, _y, w, h = region["bbox"]
+        if min(w, h) < _PANEL_MIN_SIZE or h > _PANEL_MAX_HEIGHT:
+            continue
+        if any(other is not region and holds(other, region["_letter"]) for other in regions):
+            continue
+        kept.append(region)
+    for region in regions:
+        del region["_letter"]
+    return kept
+
+
+#: How far ``rect: "auto"`` may move any edge of the near hint, and how much
+#: it may change its area. A snap past either keeps the hint: on a dense
+#: figure the detected region is often a neighbouring panel or two merged.
+AUTO_EDGE_SLACK = 0.03
+AUTO_AREA_SLACK = 0.25
+
+
+def _edges(box: list[float]) -> list[float]:
+    x, y, w, h = box
+    return [x, y, x + w, y + h]
+
+
+def _overlap_area(a: list[float], b: list[float]) -> float:
+    """Area shared by two ``[x0, y0, x1, y1]`` boxes."""
+    return max(min(a[2], b[2]) - max(a[0], b[0]), 0.0) * max(min(a[3], b[3]) - max(a[1], b[1]), 0.0)
+
+
+def _fit_to_hint(snap: list[float], near: list[float], avoid: list[list[float]]) -> tuple[list[float] | None, str]:
+    """Keep a snapped box close to its hint: (box, note), or (None, why) to keep the hint.
+
+    The snap is trimmed so no edge lies more than AUTO_EDGE_SLACK outside the
+    hint, and to the hint itself where it would reach into a box in ``avoid``
+    (``[x0, y0, x1, y1]``: the other boxes the same batch asks for on the
+    page). Shrinking toward the
+    hint is preferred to growing past it, but a box that still moves an edge
+    inward by more than the slack, or changes the area by more than
+    AUTO_AREA_SLACK, is not a fit of the hint.
+    """
+    slack = AUTO_EDGE_SLACK
+    hint, box = _edges(near), _edges(snap)
+    trimmed = [max(box[0], hint[0] - slack), max(box[1], hint[1] - slack),
+               min(box[2], hint[2] + slack), min(box[3], hint[3] + slack)]
+    if any(_overlap_area(trimmed, other) > _overlap_area(hint, other) + 1e-9 for other in avoid):
+        trimmed = [max(box[0], hint[0]), max(box[1], hint[1]), min(box[2], hint[2]), min(box[3], hint[3])]
+    moved = max(abs(a - b) for a, b in zip(trimmed, hint))
+    width, height = trimmed[2] - trimmed[0], trimmed[3] - trimmed[1]
+    area = max(width, 0.0) * max(height, 0.0) / max(near[2] * near[3], 1e-9)
+    if width <= 0 or height <= 0 or moved > slack + 1e-9 or abs(area - 1) > AUTO_AREA_SLACK:
+        grew = any(b < h - slack for b, h in zip(box[:2], hint[:2])) or any(
+            b > h + slack for b, h in zip(box[2:], hint[2:]))
+        size = "large" if grew or (box[2] - box[0]) * (box[3] - box[1]) > near[2] * near[3] else "small"
+        return None, f"kept hint, snap too {size} (an edge moves {moved:.3f}, area x{area:.2f})"
+    note = "trimmed to the hint" if trimmed != box else ""
+    return [trimmed[0], trimmed[1], width, height], note
+
+
+def auto_box(doc, page_num: int, near: list[float] | None = None,
+             avoid: list[list[float]] | None = None) -> dict:
+    """Fit an area box to a figure or panel on a page.
+
+    With ``near`` (``[x, y, w, h]``, normalized, a hint of roughly where the
+    box goes) the detected region that overlaps it most is used, panels
+    first, then kept close to the hint (see ``_fit_to_hint``). Without a hint
+    a page with exactly one detected region uses that one. A region is only
+    used when its confidence is not "low"; otherwise the hint is kept and the
+    note says so. ``avoid`` holds the ``[x, y, w, h]`` boxes other entries of
+    the same batch ask for on this page; the fit never reaches into one.
+
+    Returns:
+        ``{"rect", "source", "confidence", "note"}``, or ``{"error"}`` when there
+        is nothing to fit and no hint to fall back on.
+    """
+    layout = _page_regions(doc, page_num, panels=True)
+    if "error" in layout:
+        return layout
+    regions = [r for r in layout["regions"] if r["source"] != "equation"]
+    avoid = [_edges(box) for box in avoid or []]
+
+    def fall_back(why: str) -> dict:
+        if near is None:
+            return {"error": f"{why}. Give a near hint (x,y,w,h) to place it by hand."}
+        return {"rect": list(near), "source": "hint", "confidence": "low",
+                "note": f"{why}; kept the near hint as given"}
+
+    if near is None:
+        usable = [r for r in regions if r["confidence"] != "low"]
+        if len(regions) != 1 or not usable:
+            return fall_back(f"{len(regions)} candidate regions on page {page_num}")
+        chosen = usable[0]
+        rect, note = list(chosen["bbox"]), ""
+        if any(_overlap_area(_edges(rect), other) > 0 for other in avoid):
+            return fall_back("the only region overlaps another box this batch asks for")
+    else:
+        def score(region):
+            return _bbox_iou(near, region["bbox"]) * (1.15 if region["source"] == "panel" else 1.0)
+        chosen = max(regions, key=score, default=None)
+        if chosen is None or _bbox_iou(near, chosen["bbox"]) < 0.2:
+            return fall_back("no detected figure or panel overlaps the hint")
+        if chosen["confidence"] == "low":
+            return fall_back(f"{chosen['caption_label'] or chosen['source']} is a low-confidence match")
+        rect, note = _fit_to_hint(chosen["bbox"], near, avoid)
+        if rect is None:
+            return {"rect": list(near), "source": "hint", "confidence": "low", "note": note}
+    label = chosen.get("caption_label") or chosen["source"]
+    return {"rect": rect, "source": f"{chosen['source']} ({label})",
+            "confidence": chosen["confidence"], "note": note}

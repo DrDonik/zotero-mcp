@@ -14,6 +14,28 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+
+_warned: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    """Log a warning the first time this process sees it, not on every call."""
+    if message not in _warned:
+        _warned.add(message)
+        logger.warning(message)
+
+
+def _attachments_failure(error: Exception) -> str:
+    """One line on why item.attachments failed; the caller then reads Zotero directly."""
+    if "renderAnnotations" in str(error) or "rendered annotation" in str(error):
+        # Better BibTeX has Zotero render missing area-annotation thumbnails
+        # first, and that step can fail inside Zotero (2026-11-20).
+        return ("Better BibTeX could not list attachments: Zotero failed to render an area "
+                "annotation thumbnail. Annotations are read from Zotero instead; to get the "
+                "thumbnails, open the PDF in Zotero's reader, or restart Zotero.")
+    first = str(error).strip().splitlines()[0] if str(error).strip() else type(error).__name__
+    return f"Better BibTeX could not list attachments ({first[:160]}); annotations are read from Zotero instead."
+
 class BetterBibTexError(Exception):
     """A Better BibTeX JSON-RPC call could not produce a result.
 
@@ -178,21 +200,22 @@ class ZoteroBetterBibTexAPI:
             raise Exception(f"No items returned for citekey: {citekey}")
         return items[0]
 
-    def get_attachments(self, citekey: str, library_id: int) -> list[dict[str, Any]]:
+    def get_attachments(self, citekey: str, library_id: int | str | None) -> list[dict[str, Any]]:
         """
         Get all attachments for an item.
 
         Args:
             citekey: The citation key of the item
-            library_id: The library ID
+            library_id: The library selector, or None for the personal library
 
         Returns:
             A list of attachment data
         """
         try:
-            return self._make_request("item.attachments", [citekey, library_id])
+            params = [citekey] if library_id is None else [citekey, library_id]
+            return self._make_request("item.attachments", params)
         except Exception as e:
-            logger.warning(f"Could not get attachments: {e}")
+            _warn_once(_attachments_failure(e))
             return []
 
     def get_annotations_from_attachment(self, attachment: dict[str, Any]) -> list[dict[str, Any]]:
@@ -210,6 +233,17 @@ class ZoteroBetterBibTexAPI:
             return []
 
         return attachment.get('annotations', [])
+
+    def citation_key(self, item_key: str) -> str | None:
+        """
+        The citation key Better BibTeX holds for an item, by its item key.
+
+        A bare item key is looked up in My Library, which is how
+        ``item.citationkey`` reads one; an item of a group library, or one
+        Better BibTeX has no key for, gives None.
+        """
+        mapping = self._make_request("item.citationkey", {"item_keys": [item_key]})
+        return (mapping or {}).get(item_key) or None
 
     def search_citekeys(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         """

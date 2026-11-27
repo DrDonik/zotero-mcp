@@ -1,12 +1,14 @@
 // The conversation: the transcript state, the agent session behind it, and saving. No DOM here; the panel
 // renders `tr` whenever `onChange` fires.
-import type { AgentSession, ChatEvent, ContextChip, PanelHost, PanelSettings, SavedSession } from "../types.ts";
-import { clip, errMessage, nextId } from "./dom.ts";
+import type { AgentSession, BackendId, ChatEvent, ContextChip, PanelHost, PanelSettings, SavedSession } from "../types.ts";
+import { cleanTitle, clip, errMessage, nextId } from "./dom.ts";
 import { summary } from "./context.ts";
 import { chipHash, planContext } from "./economy.ts";
 import { Persister } from "./persist.ts";
+import { ownProviders } from "./settings-model.ts";
 import { applyEvent, emptyTranscript, promptFor, replay } from "./transcript.ts";
 import type { TranscriptState } from "./transcript.ts";
+import { t } from "../i18n.ts";
 
 export interface ChatDeps {
   host: PanelHost;
@@ -39,6 +41,10 @@ export class Chat {
   private resume: SavedSession | null = null;
   private unsub: (() => void) | null = null;
   private gen = 0;
+  /** The send or /compact under way. A new chat (reset) drops it: what that call still does when it comes back is no longer this chat's. */
+  private run: object | null = null;
+  /** Sessions being closed: the next one starts once they are gone (a resumed chat's own old process, above all). Never awaited by the UI. */
+  private closing: Promise<unknown> = Promise.resolve();
   private cwd = "";
   /** Chips this agent session has already read (id -> fingerprint): unchanged ones are not sent again. */
   private sent = new Map<string, string>();
@@ -77,28 +83,77 @@ export class Chat {
     this.d.host.appendEvent(this.saved, ev).catch(() => { /* a failed save must not stop the chat */ });
   }
 
+  /** The agent a start would use now: a saved chat is resumed on the agent it was made with, a new one uses the setting. */
+  get backend(): BackendId {
+    return this.session?.backend ?? (this.resume?.agentSessionId ? this.resume.backend : this.d.host.getSettings().backend);
+  }
+
   async ensureSession(): Promise<AgentSession> {
     if (this.session) return this.session;
     if (this.starting) return this.starting;
     const gen = this.gen;
     const host = this.d.host;
+    /** A new chat or a changed agent replaced this start while it ran: its session, if it got one, is closed. */
+    const current = (sess?: AgentSession) => {
+      if (gen === this.gen) return;
+      void sess?.close().catch(() => {});
+      throw new Error("cancelled");
+    };
     const p = (async () => {
-      const set = host.getSettings();
-      const prep = await host.prepareSession(this.resume?.cwd);
-      this.cwd = prep.cwd;
-      const sess = await host.runtime.start({
-        backend: set.backend, cwd: prep.cwd, brief: prep.brief, env: prep.env,
-        ...(set.model[set.backend] ? { model: set.model[set.backend] } : {}),
-        ...(set.mode[set.backend] ? { mode: set.mode[set.backend] } : {}),
-        ...(set.effort[set.backend] ? { effort: set.effort[set.backend] } : {}),
-        ...(set.backend !== "pi" ? { auth: set.auth[set.backend] } : {}),
-        ...(this.resume?.agentSessionId ? { resumeSessionId: this.resume.agentSessionId } : {}),
-      });
-      if (gen !== this.gen) { void sess.close().catch(() => {}); throw new Error("cancelled"); }
+      await this.closing;
+      current();
+      const resume = this.resume?.agentSessionId ? this.resume : null;
+      const folder = this.resume?.cwd;
+      const start = async (set: PanelSettings, b: BackendId, resumeSessionId?: string) => {
+        const prep = await host.prepareSession(folder, b);
+        current();
+        this.cwd = prep.cwd;
+        return host.runtime.start({
+          backend: b, cwd: prep.cwd, brief: prep.brief, env: prep.env,
+          ...(set.model[b] ? { model: set.model[b] } : {}),
+          ...(set.mode[b] ? { mode: set.mode[b] } : {}),
+          ...(set.effort[b] ? { effort: set.effort[b] } : {}),
+          ...(!ownProviders(b) ? { auth: set.auth[b] } : {}),
+          ...(resumeSessionId ? { resumeSessionId } : {}),
+        });
+      };
+      let set = host.getSettings();
+      let sess: AgentSession;
+      let resumed = !!resume;
+      try {
+        sess = await start(set, resume ? resume.backend : set.backend, resume?.agentSessionId);
+      } catch (e) {
+        current();
+        // The agent no longer has this conversation (it prunes old ones), cannot load one, or the chat was made with an
+        // agent that does not start now: go on in a fresh session, once, and say so. Any other failure is reported as it is,
+        // and the chat can still be resumed when it is fixed.
+        if (!resume || !((e as Error | null)?.name === "ResumeError" || resume.backend !== set.backend)) throw e;
+        resumed = false;
+        sess = await start(set, set.backend);
+        current(sess);
+        this.resume = null;
+        this.dispatch({ t: "notice", level: "info", message: t("chat.resumeFresh") });
+      }
+      current(sess);
+      // The settings may have changed while this started (the panel starts a session as soon as it opens).
+      const now = host.getSettings();
+      if (!resumed && now.backend !== sess.backend) {
+        await sess.close().catch(() => {});
+        current();
+        sess = await start((set = now), now.backend);
+        current(sess);
+      } else {
+        const b = sess.backend;
+        if (now.model[b] !== set.model[b]) { const m = now.model[b] || sess.defaultModel(); if (m && m !== sess.currentModel()) await sess.setModel(m).catch(() => {}); }
+        if (now.mode[b] && now.mode[b] !== set.mode[b] && now.mode[b] !== sess.currentMode()) await sess.setMode(now.mode[b]).catch(() => {});
+        if (now.effort[b] && now.effort[b] !== set.effort[b] && now.effort[b] !== sess.currentEffort()) await sess.setEffort(now.effort[b]).catch(() => {});
+        current(sess);
+      }
       this.session = sess;
       this.sent.clear(); // a new or resumed session: everything goes in full once (DESIGN.md "Context budget")
       this.resume = null;
       this.unsub = sess.on((ev) => {
+        if (ev.t === "session_title") this.takeAgentTitle(ev.title); // before dispatch: the persist writes the new title to the index
         this.dispatch(ev);
         if (ev.t === "turn_end") { this.d.turnEnded(ev.stop); this.persister.flush(); }
       });
@@ -109,24 +164,35 @@ export class Chat {
     return p;
   }
 
-  async closeSession(): Promise<void> {
+  /** Lets go of the session at once; the process is stopped behind (resolves when it is gone). Nothing in the UI waits for that. */
+  closeSession(): Promise<void> {
     const s = this.session;
     this.unsub?.();
     this.unsub = null;
     this.session = null;
     this.starting = null;
     this.gen++;
-    if (s) await s.close().catch(() => {});
-    this.d.sessionChanged();
+    const before = this.closing;
+    const done = (s ? s.close().catch(() => {}) : Promise.resolve()).then(() => { this.d.sessionChanged(); });
+    this.closing = done.then(() => before);
+    return done;
   }
 
   async send(text: string, used: ContextChip[]): Promise<void> {
     if (this.busy || this.d.blockReason()) return;
     const host = this.d.host;
     if (!this.saved) {
-      this.saved = { id: nextId("s") + Date.now().toString(36), title: clip(text, 60), backend: host.getSettings().backend, cwd: this.resume?.cwd ?? "", agentSessionId: this.resume?.agentSessionId ?? "", updatedAt: Date.now() };
+      const set = host.getSettings();
+      // The chat's name starts on the first filled rung of its source's chain: agent summary can never be ready
+      // here (it arrives during the turn), so agent falls to the focused paper, then the question. The source is
+      // snapshotted onto the chat: changing the setting later never re-rules an existing conversation.
+      const titleSource = set.titleSource;
+      const paper = titleSource === "question" ? null : host.paperTitle(used);
+      this.saved = { id: nextId("s") + Date.now().toString(36), title: paper ? clip(paper, 80) : clip(text, 60), titleSource, backend: set.backend, cwd: this.resume?.cwd ?? "", agentSessionId: this.resume?.agentSessionId ?? "", updatedAt: Date.now() };
     }
     this.sending = true;
+    const run = (this.run = {});
+    const mine = () => this.run === run;
     // The bubble shows what the composer showed: context already in this chat is only named to the agent, not shown again.
     const fresh = used.filter((c) => !this.isShown(c));
     for (const c of used) this.shown.set(c.id, chipHash(c));
@@ -137,9 +203,11 @@ export class Chat {
       // The focused paper's metadata and full-text file, prepared while the session starts (never longer than 1.5 s after).
       const paper = host.paperContext(used, starting).catch(() => [] as ContextChip[]);
       const sess = await starting;
-      this.saved = { ...this.saved, agentSessionId: sess.sessionId, cwd: this.cwd || this.saved.cwd };
+      if (!mine() || !this.saved) return;
+      this.saved = { ...this.saved, backend: sess.backend, agentSessionId: sess.sessionId, cwd: this.cwd || this.saved.cwd };
       let ctx = { text: "", images: [] as { mime: string; data: string }[] };
       const extra = await paper;
+      if (!mine()) return;
       try {
         const next = new Map(this.sent);
         const plan = planContext([...used, ...extra], next);
@@ -147,19 +215,54 @@ export class Chat {
         this.sent = next;
         this.lastContext = plan;
       } catch { /* the question still goes */ }
-      if (ctx.images.length && !sess.supportsImages) this.dispatch({ t: "notice", level: "warn", message: "This agent doesn't take images, so the pictures were left out of that message." });
+      if (ctx.images.length && !sess.supportsImages) this.dispatch({ t: "notice", level: "warn", message: t("chat.noImages") });
       const said = await this.d.expand(text, this.cwd);
+      if (!mine()) return;
       await sess.prompt({
         text: [ctx.text, said].filter(Boolean).join("\n\n"),
         ...(sess.supportsImages && ctx.images.length ? { images: ctx.images } : {}),
       });
     } catch (e) {
-      await this.fail(e);
+      // A new chat was started (or the panel closed) while this one was answering: closing its session is what rejected
+      // the prompt. That is not a failure of the chat left behind, and nothing of it belongs to the new one.
+      if (mine()) await this.fail(e);
     } finally {
-      this.sending = false;
-      this.persister.flush();
-      this.d.onChange();
+      if (mine()) {
+        this.run = null;
+        this.sending = false;
+        this.persister.flush();
+        this.d.onChange();
+      }
     }
+  }
+
+  /** The agent named the conversation (ACP `session_info_update`): it replaces the fallback name whenever it arrives — unless the chat runs under another naming source, or the user has named it themselves. */
+  private takeAgentTitle(title: string): void {
+    const s = this.saved;
+    const name = cleanTitle(title); // agent text: control characters and length are ours to bound (it renders as text, never markup)
+    if (!s || !name || s.titleLocked || (s.titleSource === "paper" || s.titleSource === "question")) return;
+    this.saved = { ...s, title: name };
+  }
+
+  /** A user rename, from the chat header or the history list: it wins over every automatic source, permanently. Empty changes nothing. */
+  async rename(title: string): Promise<void> {
+    const s = this.saved;
+    const name = cleanTitle(title);
+    if (!s || !name || (s.title === name && s.titleLocked)) return;
+    // Take it in memory first: the transcript saver rewrites this chat's index entry from `this.saved` while the
+    // answer streams, and a write queued behind the rename must not put the old title (and no lock) back.
+    this.saved = { ...s, title: name, titleLocked: true };
+    this.d.onChange();
+    try { await this.d.host.renameSession(s.id, name); }
+    catch (e) { if (this.saved?.id === s.id) this.saved = s; this.d.onChange(); throw e; }
+  }
+
+  /** A rename done elsewhere (the history list): when it is this open chat's, mirror it, so the header stays in step. */
+  adoptRename(id: string, title: string): void {
+    const s = this.saved;
+    if (!s || s.id !== id) return;
+    this.saved = { ...s, title, titleLocked: true };
+    this.d.onChange();
   }
 
   /** Summarise the conversation now (the bridge's own /compact, when it has a verified one); a notice tells the result. */
@@ -167,15 +270,19 @@ export class Chat {
     const s = this.session;
     if (!s?.canCompact || this.busy) return;
     this.sending = this.compacting = true;
+    const run = (this.run = {});
     this.d.onChange();
     try {
       await s.compact();
     } catch (e) {
-      await this.fail(e);
+      if (this.run === run) await this.fail(e);
     } finally {
-      this.sending = this.compacting = false;
-      this.persister.flush();
-      this.d.onChange();
+      if (this.run === run) {
+        this.run = null;
+        this.sending = this.compacting = false;
+        this.persister.flush();
+        this.d.onChange();
+      }
     }
   }
 
@@ -184,10 +291,10 @@ export class Chat {
     if (msg === "cancelled") return;
     const running = this.tr.running;
     if (running) this.dispatch({ t: "turn_end", turn: running, stop: "error" });
-    this.dispatch({ t: "notice", level: "error", message: this.session ? `The agent stopped: ${msg}` : `Couldn't start the agent: ${msg}`, hint: "Check Status for what is missing, then send again." });
+    this.dispatch({ t: "notice", level: "error", message: this.session ? t("chat.stopped", { error: msg }) : t("chat.startFailed", { error: msg }), hint: t("chat.checkStatus") });
     // A rejected prompt means the bridge is gone: the next send starts a fresh one and resumes this chat.
     if (this.session) this.resume = this.saved;
-    await this.closeSession();
+    void this.closeSession();
     this.d.setupFailed();
   }
 
@@ -225,15 +332,16 @@ export class Chat {
     await this.d.host.setSettings({ [kind]: { ...s[kind], [backend]: id } } as Partial<PanelSettings>);
   }
 
-  /** A new, empty chat. */
+  /**
+   * A new, empty chat, at once. The chat left behind is saved as it stood (an answer still streaming ends "stopped"), and
+   * its agent is stopped behind: nothing here waits for the process to die, and what a send still under way does when it
+   * comes back is dropped (`run`).
+   */
   async reset(): Promise<void> {
-    if (this.busy) await this.stop();
-    this.persister.flush();
-    await this.closeSession();
+    this.leave();
     this.tr = emptyTranscript();
     this.saved = null;
     this.resume = null;
-    this.sending = false;
     this.lastContext = [];
     this.shown.clear();
     this.d.shownChanged();
@@ -248,12 +356,33 @@ export class Chat {
       // A save that ends mid-turn (a crash) must not look like it is still streaming.
       if (this.tr.running) this.tr = applyEvent(this.tr, { t: "turn_end", turn: this.tr.running, stop: "cancelled" });
     } catch (e) {
-      this.tr = replay([{ t: "notice", level: "error", message: `Couldn't open that chat: ${errMessage(e)}` }]);
+      this.tr = replay([{ t: "notice", level: "error", message: t("chat.loadFailed", { error: errMessage(e) }) }]);
     }
     this.saved = s;
     this.resume = s;
     this.d.onChange();
   }
 
-  flush(): void { this.persister.flush(); }
+  /** The saved chats were all deleted: this one is no longer one of them, and nothing of it still waiting is written. */
+  forget(): void {
+    this.persister.drop();
+    this.saved = null;
+    this.resume = null;
+  }
+
+  /** The chat is being left (a new chat, the panel going away): save it as it stands, and let its session go. */
+  private leave(): void {
+    this.run = null;
+    this.sending = this.compacting = false;
+    const running = this.tr.running;
+    if (running && this.saved) this.dispatch({ t: "turn_end", turn: running, stop: "cancelled" });
+    this.persister.flush();
+    void this.closeSession();
+  }
+
+  /** The panel is going away: the chat is saved as it stands and its agent stopped; resolves when the process is gone. */
+  dispose(): Promise<void> {
+    this.leave();
+    return this.closing.then(() => {});
+  }
 }

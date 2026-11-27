@@ -26,10 +26,13 @@ from zotero_mcp import cli_json as _cli_json
 # Reuse environment setup from the original CLI module
 from zotero_mcp.cli import (
     _format_chunking_status,
-    _print_batch_import,
-    _print_batch_status,
-    _print_update_stats,
+    add_batch_import_arguments,
+    add_batch_status_arguments,
+    add_update_db_arguments,
     obfuscate_config_for_display,
+    run_batch_import,
+    run_batch_status,
+    run_update_db,
     setup_zotero_environment,
     tolerate_console_encoding,
 )
@@ -39,10 +42,18 @@ from zotero_mcp.cli import (
 # ---------------------------------------------------------------------------
 
 class CLIContext:
-    """Drop-in replacement for fastmcp.Context that writes to stderr."""
+    """Drop-in replacement for fastmcp.Context that writes to stderr.
+
+    Errors are held until the command's result is printed (see
+    :func:`_flush_errors`): a tool that fails typically logs the raw exception
+    and then returns the same failure, explained, and printing both showed
+    every failure twice, the unhelpful version first (#744). With --verbose
+    they print as they happen.
+    """
 
     def __init__(self, verbose: bool = False):
         self._verbose = verbose
+        self._held_errors: list[str] = []
 
     def info(self, message: str) -> None:
         if self._verbose:
@@ -52,7 +63,32 @@ class CLIContext:
         print(f"[WARN] {message}", file=sys.stderr)
 
     def error(self, message: str) -> None:
-        print(f"[ERROR] {message}", file=sys.stderr)
+        if self._verbose:
+            print(f"[ERROR] {message}", file=sys.stderr)
+        else:
+            self._held_errors.append(str(message))
+
+    def flush_errors(self, failure: str | None = None, shown: str | None = None) -> None:
+        """Print held errors, leaving out those the output already reports.
+
+        An error is left out when it opens with the same words, up to the
+        first colon, as the first line of *failure* ("Error adding by
+        BibTeX: [Errno 61] ..." against "Error adding by BibTeX: Zotero is
+        not running ..."), or when the result *shown* contains it verbatim.
+        """
+        held, self._held_errors = self._held_errors, []
+        reported = _error_head(failure) if failure else None
+        for message in held:
+            if reported is not None and _error_head(message) == reported:
+                continue
+            if shown and message in shown:
+                continue
+            print(f"[ERROR] {message}", file=sys.stderr)
+
+
+def _error_head(text: str) -> str:
+    first = text.strip().splitlines()[0] if text.strip() else ""
+    return first.split(":", 1)[0].strip(" #*>").lower()
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +103,22 @@ def _import_tools():
 
 
 def _ctx(args) -> CLIContext:
-    return CLIContext(verbose=getattr(args, "verbose", False))
+    """The command's context: one per command, so its held errors are
+    printed once, by :func:`_flush_errors`."""
+    ctx = getattr(args, "_cli_ctx", None)
+    if not isinstance(ctx, CLIContext):
+        ctx = CLIContext(verbose=getattr(args, "verbose", False))
+        try:
+            args._cli_ctx = ctx
+        except Exception:
+            pass
+    return ctx
+
+
+def _flush_errors(args, failure: str | None = None, shown: str | None = None) -> None:
+    ctx = getattr(args, "_cli_ctx", None)
+    if isinstance(ctx, CLIContext):
+        ctx.flush_errors(failure, shown)
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +142,9 @@ def _out(args, command: str, *, data=None, text: str | None = None) -> None:
     """
     if text is not None:
         text = _cli_vocabulary(text)
-    if data is None and text is not None and _reports_failure(text):
+    failed = data is None and text is not None and _reports_failure(text)
+    _flush_errors(args, text if failed else None, text)
+    if failed:
         # Most tools return their failures as prose rather than raising. Left
         # alone, that prose became an `ok: true` envelope with exit code 0, so
         # a caller that checked `ok` believed a failed write had worked.
@@ -242,7 +295,28 @@ def cmd_config(args):
         print(f"  {k}={v}")
 
 
+def _json_flag(args, command: str, flag: str, raw):
+    """A flag's JSON value, or a usage error naming the flag.
+
+    Called before the tools are imported: a typo in the JSON should not cost
+    the third of a second that takes, and it is the caller's mistake, so it
+    is reported like every other usage error (:func:`_fail`).
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        _fail(args, command, f"invalid JSON in {flag}: {e}", "bad_json")
+
+
 def cmd_search(args):
+    conditions = filters = None
+    if args.mode == "advanced":
+        if not args.conditions:
+            _fail(args, "search", "--mode advanced needs --conditions (a JSON list)", "bad_args")
+        conditions = _json_flag(args, "search", "--conditions", args.conditions)
+    elif args.mode == "semantic" and getattr(args, "filters", None):
+        filters = _json_flag(args, "search", "--filters", args.filters)
+
     setup_zotero_environment()
     search_mod, retrieval, annotations, write_mod, _client = _import_tools()
     ctx = _ctx(args)
@@ -255,11 +329,6 @@ def cmd_search(args):
     elif args.mode == "citekey":
         result = search_mod.search_by_citation_key(citekey=args.query, ctx=ctx)
     elif args.mode == "advanced":
-        try:
-            conditions = json.loads(args.conditions)
-        except json.JSONDecodeError as e:
-            print(f"Error: invalid JSON in --conditions: {e}", file=sys.stderr)
-            sys.exit(1)
         result = search_mod.advanced_search(
             conditions=conditions, join_mode=args.join_mode,
             sort_by=args.sort_by, sort_direction=args.sort_direction,
@@ -267,16 +336,10 @@ def cmd_search(args):
             search_all_libraries=getattr(args, "all_libraries", False), ctx=ctx,
         )
     elif args.mode == "semantic":
-        filters = None
-        if getattr(args, "filters", None):
-            try:
-                filters = json.loads(args.filters)
-            except json.JSONDecodeError as e:
-                print(f"Error: invalid JSON in --filters: {e}", file=sys.stderr)
-                sys.exit(1)
         result = search_mod.semantic_search(
             query=args.query, limit=args.limit, filters=filters,
-            search_all_libraries=getattr(args, "all_libraries", False), ctx=ctx,
+            search_all_libraries=getattr(args, "all_libraries", False),
+            level=getattr(args, "level", None), ctx=ctx,
         )
     elif args.mode == "notes":
         result = annotations.search_notes(query=args.query, limit=args.limit, ctx=ctx)
@@ -311,9 +374,7 @@ def cmd_get(args):
     json_mode = _json_mode(args)
 
     if sub == "metadata":
-        # In JSON mode the raw Zotero record is strictly better than a
-        # projection: the caller asked for one specific item, so there is
-        # nothing to trim for size and no reason to hide a field.
+        # For a single item, use the metadata tool's structured Zotero record.
         fmt = "json" if (json_mode and args.output_format == "markdown") else args.output_format
         result = retrieval.get_item_metadata(
             item_key=args.item_key, include_abstract=not args.no_abstract,
@@ -355,7 +416,7 @@ def cmd_get(args):
                 "collections": [_cli_json.project_collection(c) for c in cols],
             })
             return
-        print(retrieval.get_collections(limit=args.limit, ctx=ctx))
+        _out(args, "get collections", text=retrieval.get_collections(limit=args.limit, ctx=ctx))
     elif sub == "collection-items":
         result = retrieval.get_collection_items(
             collection_key=args.collection_key, detail=args.detail, limit=args.limit,
@@ -403,7 +464,7 @@ def cmd_get(args):
                 "tags": [_cli_json.project_tag(t) for t in tags],
             })
             return
-        print(retrieval.get_tags(limit=args.limit, ctx=ctx))
+        _out(args, "get tags", text=retrieval.get_tags(limit=args.limit, ctx=ctx))
     elif sub == "recent":
         result = retrieval.get_recent(
             limit=args.limit, collection_key=getattr(args, "collection", None), ctx=ctx,
@@ -443,11 +504,12 @@ def cmd_annotations(args):
     if args.subcommand == "list":
         # The tool already speaks JSON here, so --json just selects it and
         # wraps the result in the envelope every other command uses.
-        fmt = "json" if (json_mode and args.format == "markdown") else args.format
-        result = annotations.get_annotations(
+        positions = getattr(args, "positions", False)
+        fmt = "json" if ((json_mode or positions) and args.format == "markdown") else args.format
+        result = annotations.list_annotations(
             item_key=getattr(args, "item_key", None),
             use_pdf_extraction=args.pdf_extraction,
-            limit=args.limit, format=fmt, ctx=ctx,
+            limit=args.limit, format=fmt, positions=positions, ctx=ctx,
         )
         if json_mode:
             try:
@@ -457,11 +519,17 @@ def cmd_annotations(args):
             return
         print(result)
     elif args.subcommand == "create":
+        if str(getattr(args, "rect", None) or "").strip().lower() == "auto":
+            _create_auto_box(args, annotations, ctx)
+            return
+        if getattr(args, "near", None):
+            raise _cli_json.CliError("--near goes with --rect auto", code="bad_rect")
         text = annotations.create_annotation(
             attachment_key=args.attachment_key, page=args.page,
             text=getattr(args, "text", None),
             rect=_parse_rect(getattr(args, "rect", None)),
             note=_parse_rect(getattr(args, "note", None), size=2, flag="--note"),
+            underline=getattr(args, "underline", False),
             comment=getattr(args, "comment", None),
             color=_resolve_color(args.color),
             tags=_split_tags(getattr(args, "tags", None)), ctx=ctx,
@@ -475,12 +543,16 @@ def cmd_annotations(args):
     elif args.subcommand == "batch":
         _annotations_batch(args, annotations, ctx)
     elif args.subcommand == "update":
-        _out(args, "annotations update", text=annotations.update_annotation(
+        _out(args, "annotations update", text=annotations.change_annotation(
             annotation_key=args.annotation_key, text=getattr(args, "text", None),
             comment=getattr(args, "comment", None), color=getattr(args, "color", None),
             add_tags=_split_tags(getattr(args, "add_tags", None)),
-            remove_tags=_split_tags(getattr(args, "remove_tags", None)), ctx=ctx,
+            remove_tags=_split_tags(getattr(args, "remove_tags", None)),
+            rect=_parse_rect(getattr(args, "rect", None)),
+            page=getattr(args, "page", None), ctx=ctx,
         ))
+    elif args.subcommand == "preview":
+        _annotations_preview(args, annotations, ctx)
     elif args.subcommand == "delete":
         _out(args, "annotations delete", text=annotations.delete_annotation(
             annotation_key=args.annotation_key, ctx=ctx,
@@ -493,6 +565,55 @@ def cmd_annotations(args):
         else:
             print(f"Unknown 'annotations' subcommand: {args.subcommand}", file=sys.stderr)
         sys.exit(1)
+
+
+def _create_auto_box(args, annotations, ctx) -> None:
+    """`annotations create --rect auto`: fit a box to the nearest figure or panel."""
+    if getattr(args, "text", None) or getattr(args, "note", None):
+        raise _cli_json.CliError("--rect auto cannot go with --text or --note", code="bad_rect")
+    spec = {"page": args.page, "rect": "auto", "near": _parse_rect(getattr(args, "near", None), flag="--near"),
+            "comment": getattr(args, "comment", None), "color": _resolve_color(args.color),
+            "tags": _split_tags(getattr(args, "tags", None))}
+    (result,) = annotations.create_annotations(args.attachment_key, [spec], ctx=ctx)
+    if not result["ok"]:
+        _out(args, "annotations create", text=result["error"])
+        return
+    auto = result["auto"]
+    x, y, w, h = auto["rect"]
+    text = "\n".join([
+        "Successfully created area annotation", "",
+        f"**Annotation Key:** {result['annotation_key']}",
+        f"**Page:** {result['page_label']}",
+        f"**Rect (normalized):** x={x:.4f}, y={y:.4f}, width={w:.4f}, height={h:.4f}",
+        f"**Fitted to:** {auto['source']}, {auto['confidence']} confidence"
+        + (f" ({auto['note']})" if auto["note"] else ""),
+    ])
+    if getattr(args, "open", False):
+        _launch_url(_reader_url(args.attachment_key, page=args.page, annotation_key=result["annotation_key"]))
+    _out(args, "annotations create", text=text)
+
+
+def _annotations_preview(args, annotations, ctx) -> None:
+    """`annotations preview`: stored annotations drawn on page images."""
+    import os
+    import tempfile
+
+    if not 0.2 <= args.scale <= 6:
+        raise _cli_json.CliError(f"--scale must be between 0.2 and 6, got {args.scale}", code="bad_scale")
+    out_dir = args.out or tempfile.mkdtemp(prefix="zotero_preview_")
+    images, error = annotations.preview_annotations(
+        args.attachment_key, _parse_pages(args.pages), out_dir, args.scale, ctx=ctx)
+    if error:
+        _out(args, "annotations preview", text=error)
+        return
+    if _json_mode(args):
+        _cli_json.emit("annotations preview", {
+            "attachment_key": args.attachment_key, "out": os.path.abspath(out_dir),
+            "images": [{k: v for k, v in image.items() if k != "boxes"} for image in images]})
+        return
+    for image in images:
+        print(f"p{image['page']}: {image['path']} ({image['annotations']} annotation(s), "
+              f"{image['width']}x{image['height']})")
 
 
 def _read_annotation_specs(source: str) -> list[dict]:
@@ -531,6 +652,16 @@ def _read_annotation_specs(source: str) -> list[dict]:
     return specs
 
 
+def _auto_note(result: dict) -> str:
+    """What `rect: auto` chose for one batch row, so a fallback to the hint is never silent."""
+    auto = result.get("auto")
+    if not auto:
+        return ""
+    x, y, w, h = auto["rect"]
+    note = f"; {auto['note']}" if auto["note"] else ""
+    return f" (auto: {auto['source']}, {auto['confidence']}: {x:.4f},{y:.4f},{w:.4f},{h:.4f}{note})"
+
+
 def _annotations_batch(args, annotations, ctx) -> None:
     """`annotations batch`: create (or with --dry-run, locate) many annotations.
 
@@ -541,13 +672,19 @@ def _annotations_batch(args, annotations, ctx) -> None:
     """
     import time
 
+    render_dir = getattr(args, "render", None)
+    existing = getattr(args, "on_existing", None)
+    if render_dir and not args.dry_run:
+        raise _cli_json.CliError(
+            "--render draws the planned annotations, so it needs --dry-run; "
+            "to see what is already written, use `annotations preview`", code="bad_render")
     specs = _read_annotation_specs(args.file)
     started = time.monotonic()
 
     groups: dict[str, list[int]] = {}
     for position, spec in enumerate(specs):
         groups.setdefault(spec.get("attachment_key") or args.attachment_key, []).append(position)
-        for key, size in (("rect", 4), ("note", 2)):
+        for key, size in (("rect", 4), ("note", 2), ("near", 4)):
             if spec.get(key) is not None:
                 try:
                     spec[key] = _parse_rect(spec[key], size=size, flag=key)
@@ -560,7 +697,8 @@ def _annotations_batch(args, annotations, ctx) -> None:
     for attachment_key, positions in groups.items():
         outcomes = annotations.create_annotations(
             attachment_key, [specs[p] for p in positions], ctx=ctx,
-            dry_run=args.dry_run, allow_epub=True,
+            dry_run=args.dry_run, allow_epub=True, render_dir=render_dir,
+            **({"existing": existing} if existing else {}),
         )
         for position, outcome in zip(positions, outcomes):
             results[position] = {**outcome, "index": position + 1}
@@ -568,32 +706,66 @@ def _annotations_batch(args, annotations, ctx) -> None:
                 results[position]["error"] = _cli_vocabulary(outcome["error"].strip())
 
     failed = [r for r in results if not r["ok"]]
+    skipped = [r for r in results if r.get("skipped")]
     seconds = round(time.monotonic() - started, 2)
 
     if _json_mode(args):
         _cli_json.emit("annotations batch", {
             "dry_run": bool(args.dry_run),
             "succeeded": len(results) - len(failed),
+            "skipped": len(skipped),
             "failed": len(failed),
             "seconds": seconds,
             "results": results,
         })
     else:
-        for r in results:
+        # One cause for every row (a PDF that cannot be fetched) is said once.
+        causes = {r["error"] for r in failed}
+        collapsed = len(failed) == len(results) > 1 and len(causes) == 1
+        if collapsed:
+            first = next(iter(causes)).strip().splitlines()[0]
+            print(f"FAIL  all {len(results)} entries: {first}")
+            if "client configured" in first or "Could not download" in first:
+                print("      The PDF could not be fetched. Start Zotero (with 'Allow other applications "
+                      "on this computer to communicate with Zotero' on), or set ZOTERO_LOCAL=true so "
+                      "the file is read from disk.")
+        # A broken text layer fails every highlight on its page the same way.
+        unreadable: dict[str, list[str]] = {}
+        for r in [] if collapsed else failed:
+            if r.get("unreadable_text"):
+                unreadable.setdefault(r["error"], []).append(f"#{r['index']}")
+        for error, rows in unreadable.items():
+            print(f"FAIL  {', '.join(rows)}: {error}")
+        for r in [] if collapsed else results:
             where = f"#{r['index']} p{r['page']}"
+            if r.get("unreadable_text"):
+                continue
+            if r.get("skipped"):
+                print(f"skip  {where} already there as {r['annotation_key']}")
+                continue
             if not r["ok"]:
                 print(f"FAIL  {where}: {r['error']}")
-            elif args.dry_run and r["type"] == "highlight":
+                continue
+            replaced = f" (replaces {', '.join(r['replaced'])})" if r.get("replaced") else ""
+            if args.dry_run and r["type"] in ("highlight", "underline"):
                 found = r.get("page_found") or r.get("chapter_found")
                 moved = f" (found on p{found})" if found not in (None, r["page"]) else ""
-                print(f"ok    {where}{moved}: {r.get('matched_text', '')[:120]}")
+                print(f"ok    {where}{moved}: {r.get('matched_text', '')[:120]}{replaced}")
             elif args.dry_run:
-                print(f"ok    {where} area")
+                print(f"ok    {where} area{_auto_note(r)}{replaced}")
             else:
-                print(f"ok    {where} {r['type']} {r['annotation_key']}")
+                print(f"ok    {where} {r['type']} {r['annotation_key']}{_auto_note(r)}{replaced}")
+            if r.get("warning"):
+                print(f"WARN  {where}: {r['warning']}")
         verb = "Located" if args.dry_run else "Created"
-        print(f"\n{verb} {len(results) - len(failed)}/{len(results)} in {seconds}s"
-              + (f"; {len(failed)} failed" if failed else ""))
+        done = len(results) - len(failed) - len(skipped)
+        warned = [r for r in results if r.get("warning")]
+        print(f"\n{verb} {done}/{len(results)} in {seconds}s"
+              + (f"; {len(skipped)} already there" if skipped else "")
+              + (f"; {len(failed)} failed" if failed else "")
+              + (f"; {len(warned)} old annotation(s) not deleted, see WARN" if warned else ""))
+        for path in sorted({r["rendered"] for r in results if r.get("rendered")}):
+            print(f"rendered: {path}")
 
     if failed:
         sys.exit(1)
@@ -604,7 +776,8 @@ def cmd_layout(args):
     setup_zotero_environment()
     _s, _r, annotations, _w, _c = _import_tools()
     pages = _parse_pages(args.pages)
-    layouts, filename, error = annotations.detect_layouts(args.attachment_key, pages, ctx=_ctx(args))
+    layouts, filename, error = annotations.detect_layouts(
+        args.attachment_key, pages, panels=getattr(args, "panels", False), ctx=_ctx(args))
     if error:
         _out(args, "layout", text=error)
         return
@@ -642,6 +815,13 @@ def cmd_layout(args):
 
 
 def cmd_notes(args):
+    new_note_text = None
+    if args.subcommand == "create":
+        new_note_text = sys.stdin.read() if args.text == "-" else (args.text or "")
+        if not new_note_text:
+            _fail(args, "notes create",
+                  "provide note text via --text TEXT or --text - (reads stdin)", "bad_args")
+
     setup_zotero_environment()
     search_mod, retrieval, annotations, write_mod, _client = _import_tools()
     ctx = _ctx(args)
@@ -672,15 +852,10 @@ def cmd_notes(args):
             return
         print(result)
     elif args.subcommand == "create":
-        note_text = sys.stdin.read() if args.text == "-" else (args.text or "")
-        if not note_text:
-            print("Error: provide note text via --text TEXT or --text - (reads stdin)",
-                  file=sys.stderr)
-            sys.exit(1)
         tags = _split_tags(args.tags) or []
         _out(args, "notes create", text=annotations.create_note(
             item_key=args.item_key, note_title=args.title or "CLI Note",
-            note_text=note_text, tags=tags, ctx=ctx,
+            note_text=new_note_text, tags=tags, ctx=ctx,
         ))
     elif args.subcommand == "update":
         note_text = sys.stdin.read() if args.text == "-" else args.text
@@ -708,6 +883,107 @@ def _collect_collection_specs(args) -> list | None:
     return specs or None
 
 
+_ADDED_KEY_RE = re.compile(r"Item key: `([^`]+)`")
+
+
+def _attachable(path: str) -> str | None:
+    """``path`` made absolute, or None when attach_file would refuse it.
+
+    Checked before the item is added, so a predictable attach failure never
+    leaves an item without its file.
+    """
+    import os
+
+    path = os.path.abspath(os.path.expanduser(path))
+    return None if os.path.islink(path) or not os.path.isfile(path) else path
+
+
+def _attach_to_added(write_mod, added: str, path: str, if_exists: str, ctx) -> str:
+    """Attach a local file to the item an `add` just reported, in the same call.
+
+    Returns the add's text with the attach result under it. A failure comes
+    back starting with "Error", so it is reported as one, even though the item
+    itself was added. ``--if-exists skip`` leaves an existing item untouched,
+    its attachments included.
+    """
+    match = _ADDED_KEY_RE.search(added)
+    if not match:
+        return added  # the add failed or named no item; its own message says why
+    if if_exists == "skip" and added.startswith("Already in library"):
+        return f"{added}\n\nFile not attached (--if-exists skip)."
+    attached = write_mod.attach_file(item_key=match.group(1), file_path=path, ctx=ctx)
+    if _reports_failure(attached):
+        return f"Error: the item was added ({match.group(1)}) but its file was not attached.\n\n{attached}"
+    return f"{added}\n\n{attached}"
+
+
+def _add_folder(args, write_mod, collections, tags, if_exists, create_missing, ctx) -> None:
+    """`add folder`: add and attach every PDF in a folder, by the DOI found in each."""
+    import os
+
+    from zotero_mcp.pdf_utils import doi_from_pdf
+
+    folder = os.path.abspath(os.path.expanduser(args.folder))
+    if not os.path.isdir(folder):
+        raise _cli_json.CliError(f"Not a folder: {folder}", code="bad_folder")
+    files = sorted(name for name in os.listdir(folder) if name.lower().endswith(".pdf"))
+    if not files:
+        raise _cli_json.CliError(f"No PDF files in {folder}", code="empty_folder")
+
+    rows = []
+    for name in files:
+        path = _attachable(os.path.join(folder, name))
+        row = {"file": name, "doi": None, "status": "", "item_key": None}
+        rows.append(row)
+        if path is None:
+            row["status"] = "unresolved: not a regular file (symlinks are not followed)"
+            continue
+        try:
+            row["doi"], found = doi_from_pdf(path)
+        except Exception as exc:
+            row["status"] = f"unresolved: could not read the PDF ({exc})"
+            continue
+        if not row["doi"]:
+            row["status"] = f"unresolved: {found}"
+        elif args.dry_run:
+            row["status"] = f"would add ({found})"
+        else:
+            added = write_mod.add_by_doi(
+                doi=row["doi"], collections=collections, tags=tags, attach_mode="none",
+                if_exists=if_exists, create_missing_collections=create_missing,
+                page_check="thin_only", ctx=ctx)
+            match = _ADDED_KEY_RE.search(added)
+            if not match:
+                row["status"] = "failed: " + _cli_vocabulary(added.strip().splitlines()[0])
+                continue
+            row["item_key"] = match.group(1)
+            if if_exists == "skip" and added.startswith("Already in library"):
+                row["status"] = f"already in the library, left untouched ({found})"
+                continue
+            attached = write_mod.attach_file(item_key=row["item_key"], file_path=path, ctx=ctx)
+            if _reports_failure(attached):
+                row["status"] = "added, not attached: " + _cli_vocabulary(attached.strip().splitlines()[0])
+            else:
+                row["status"] = (
+                    ("already in the library, " if added.startswith("Already in library") else "added, ")
+                    + ("file already attached" if "already" in attached.lower() else "file attached")
+                    + f" ({found})")
+
+    unresolved = [r for r in rows if r["status"].startswith(("unresolved", "failed", "added, not"))]
+    if _json_mode(args):
+        _cli_json.emit("add folder", {"folder": folder, "dry_run": bool(args.dry_run), "files": rows,
+                                      "unresolved": len(unresolved)})
+    else:
+        width = max(len(r["file"]) for r in rows)
+        for r in rows:
+            print(f"{r['file']:<{width}}  {(r['doi'] or '-'):<32}  {r['status']}")
+        print(f"\n{len(rows) - len(unresolved)}/{len(rows)} resolved"
+              + (f"; {len(unresolved)} need attention: add those by hand with "
+                 "`zotero-cli add doi DOI --attach-file PATH`" if unresolved else ""))
+    if unresolved:
+        sys.exit(1)
+
+
 def cmd_add(args):
     setup_zotero_environment()
     search_mod, retrieval, annotations, write_mod, _client = _import_tools()
@@ -718,11 +994,21 @@ def cmd_add(args):
     create_missing = getattr(args, "create_collections", False)
 
     if args.subcommand == "doi":
-        _out(args, "add doi", text=write_mod.add_by_doi(
+        attach_file = getattr(args, "attach_file", None)
+        if attach_file and _attachable(attach_file) is None:
+            raise _cli_json.CliError(f"--attach-file: not a regular file (symlinks are not followed): "
+                                     f"{attach_file}", code="bad_file")
+        text = write_mod.add_by_doi(
             doi=args.doi, collections=collections, tags=tags,
-            attach_mode=args.attach_mode, if_exists=if_exists,
+            # A file in hand is the attachment; fetching an open-access copy too would make two.
+            attach_mode=args.attach_mode or ("none" if attach_file else "auto"), if_exists=if_exists,
             create_missing_collections=create_missing, ctx=ctx,
-        ))
+        )
+        if attach_file:
+            text = _attach_to_added(write_mod, text, _attachable(attach_file), if_exists, ctx)
+        _out(args, "add doi", text=text)
+    elif args.subcommand == "folder":
+        _add_folder(args, write_mod, collections, tags, if_exists, create_missing, ctx)
     elif args.subcommand == "url":
         _out(args, "add url", text=write_mod.add_by_url(
             url=args.url, collections=collections, tags=tags,
@@ -797,24 +1083,6 @@ def cmd_collections(args):
         sys.exit(1)
 
 
-def cmd_tags(args):
-    # Deprecated in 0.15.2, removal in 0.17: `batch` does the same with --add-tags/--remove-tags.
-    print("zotero-cli tags is deprecated and will be removed in 0.17; use: "
-          "zotero-cli batch --add-tags ... --remove-tags ...", file=sys.stderr)
-    setup_zotero_environment()
-    search_mod, retrieval, annotations, write_mod, _client = _import_tools()
-    ctx = _ctx(args)
-    _out(args, "tags", text=write_mod.batch_update_tags(
-        query=args.query or "",
-        add_tags=_split_tags(args.add),
-        remove_tags=_split_tags(args.remove),
-        tag=_split_tags(args.tag),
-        limit=args.limit,
-        item_keys=_split_csv(args.item_keys),
-        ctx=ctx,
-    ))
-
-
 def _field_assignment(value: str) -> tuple[str, str]:
     """Parse one metadata assignment, preserving empty values and '=' in text."""
     name, separator, text = value.partition("=")
@@ -825,17 +1093,11 @@ def _field_assignment(value: str) -> tuple[str, str]:
 
 def cmd_edit(args):
     """Edit metadata fields of an existing Zotero item."""
+    creators = _json_flag(args, "edit", "--creators", args.creators) if args.creators else None
+
     setup_zotero_environment()
     search_mod, retrieval, annotations, write_mod, _client = _import_tools()
     ctx = _ctx(args)
-
-    creators = None
-    if args.creators:
-        try:
-            creators = json.loads(args.creators)
-        except json.JSONDecodeError as e:
-            print(f"Error: invalid JSON in --creators: {e}", file=sys.stderr)
-            sys.exit(1)
 
     # Flat metadata flags all travel in one `fields` mapping now; only the
     # params with delta semantics stay top-level.
@@ -899,9 +1161,19 @@ def cmd_duplicates(args):
 
 def cmd_db(args):
     """Manage the semantic search database."""
+    # Shared with `zotero-mcp update-db` / `batch-status` / `batch-import`,
+    # so the batch provider and every update flag behave the same here.
+    runner = {
+        "update": run_update_db,
+        "batch-status": run_batch_status,
+        "batch-import": run_batch_import,
+    }.get(args.subcommand)
+    if runner is not None:
+        runner(args)
+        return
+
     from pathlib import Path
     setup_zotero_environment()
-    from zotero_mcp.cli import _save_zotero_db_path_to_config
     from zotero_mcp.semantic_search import create_semantic_search
 
     config_path_arg = getattr(args, "config_path", None)
@@ -910,43 +1182,7 @@ def cmd_db(args):
         else Path.home() / ".config" / "zotero-mcp" / "config.json"
     )
 
-    if args.subcommand == "update":
-        db_path = getattr(args, "db_path", None)
-        if db_path:
-            _save_zotero_db_path_to_config(config_path, db_path)
-        search = create_semantic_search(str(config_path), db_path=db_path)
-        if getattr(args, "openai_batch", None) is True and search.chroma_client.embedding_model != "openai":
-            print("Error: --openai-batch requires ZOTERO_EMBEDDING_MODEL=openai", file=sys.stderr)
-            sys.exit(1)
-        fulltext = getattr(args, "fulltext", False)
-        if fulltext:
-            from zotero_mcp.utils import is_local_mode
-            if not is_local_mode():
-                print("Error: --fulltext requires local mode (ZOTERO_LOCAL=true).", file=sys.stderr)
-                sys.exit(1)
-        stats = search.update_database(
-            force_full_rebuild=args.force_rebuild,
-            limit=args.limit,
-            extract_fulltext=fulltext,
-            use_openai_batch=getattr(args, "openai_batch", None),
-            allow_mass_deletion=getattr(args, "allow_mass_deletion", False),
-        )
-        _print_update_stats(stats)
-        if stats.get("error"):
-            print(f"Error: {stats['error']}", file=sys.stderr)
-            sys.exit(1)
-
-    elif args.subcommand == "batch-status":
-        search = create_semantic_search(str(config_path))
-        status = search.get_openai_batch_status(batch_ids=getattr(args, "batch_id", None))
-        _print_batch_status(status)
-
-    elif args.subcommand == "batch-import":
-        search = create_semantic_search(str(config_path))
-        stats = search.import_openai_batch(batch_ids=getattr(args, "batch_id", None))
-        _print_batch_import(stats)
-
-    elif args.subcommand == "status":
+    if args.subcommand == "status":
         search = create_semantic_search(str(config_path))
         status = search.get_database_status()
         ci = status.get("collection_info", {})
@@ -955,8 +1191,20 @@ def cmd_db(args):
         print("=== Semantic Search Database Status ===")
         print(f"Collection: {ci.get('name', 'Unknown')}")
         print(f"Document count: {ci.get('count', 0)}")
+        print(f"  Article-level records: {ci.get('article_records', 0)}")
+        print(f"  Passage-level records: {ci.get('passage_records', 0)}")
+        for label, key in (("Items with article records", "article_items"), ("Items with passages", "passage_items")):
+            if key in ci:
+                print(f"  {label}: {'unknown' if ci[key] is None else ci[key]}")
         print(f"Embedding model: {ci.get('embedding_model', 'Unknown')}")
         print(f"Database path: {ci.get('persist_directory', 'Unknown')}")
+        if ci.get("migration"):
+            from zotero_mcp.index_migration import status_note
+            from zotero_mcp.utils import is_local_mode
+
+            print("\nIndex migration:")
+            for line in status_note(ci["migration"], "zotero-cli db update", local_mode=is_local_mode()):
+                print(f"  {line}")
         print("\nUpdate configuration:")
         print(f"- Auto update: {uc.get('auto_update', False)}")
         print(f"- Frequency: {uc.get('update_frequency', 'manual')}")
@@ -968,8 +1216,12 @@ def cmd_db(args):
             from zotero_mcp.chroma_client import unreadable_index_message
 
             print(f"\nError: {unreadable_index_message(ci, uc.get('last_update'))}")
+            # The status above is still worth printing, but a script asking
+            # "is the index usable" must not read exit 0.
+            sys.exit(1)
         elif ci.get("error"):
             print(f"\nError: {ci['error']}")
+            sys.exit(1)
 
     elif args.subcommand == "inspect":
         from collections import Counter
@@ -978,8 +1230,9 @@ def cmd_db(args):
         col = client.collection
 
         if args.stats:
-            meta = col.get(include=["metadatas"])
-            metas = meta.get("metadatas", [])
+            metas = []
+            for collection in client.collections():
+                metas.extend(collection.get(include=["metadatas"]).get("metadatas", []))
             info = client.get_collection_info()
             print("=== Semantic DB Stats ===")
             print(f"Collection: {info.get('name')} @ {info.get('persist_directory')}")
@@ -1191,6 +1444,8 @@ def cmd_read(args):
     find = getattr(args, "find", None)
     if rect is not None and not as_image:
         raise _cli_json.CliError("--rect needs --format image", code="bad_rect")
+    if getattr(args, "grid", False) and not as_image:
+        raise _cli_json.CliError("--grid needs --format image", code="bad_grid")
     if find is not None and as_image:
         raise _cli_json.CliError("--find searches text; it cannot go with --format image",
                                  code="bad_find")
@@ -1214,13 +1469,14 @@ def cmd_read(args):
         import tempfile
 
         header, pages = read_pdf_mod.render_pdf_pages(
-            args.item_key, args.start_page, args.end_page, rect=rect, ctx=_ctx(args),
+            args.item_key, args.start_page, args.end_page, rect=rect,
+            grid=getattr(args, "grid", False), ctx=_ctx(args),
         )
         out_dir = getattr(args, "out", None) or tempfile.mkdtemp(prefix="zotero_pages_")
         os.makedirs(out_dir, exist_ok=True)
         images = []
         for page in pages:
-            suffix = "-region" if rect is not None else ""
+            suffix = ("-region" if rect is not None else "") + ("-grid" if getattr(args, "grid", False) else "")
             path = os.path.join(out_dir, f"{args.item_key}-p{page['page']}{suffix}.png")
             with open(path, "wb") as handle:
                 handle.write(page["png"])
@@ -1249,7 +1505,9 @@ def cmd_attach(args):
     _s, _r, _a, write_mod, _c = _import_tools()
     _out(args, "attach", text=write_mod.attach_file(
         item_key=args.item_key, file_path=args.file, url=args.url,
-        filename=args.filename, ctx=_ctx(args),
+        filename=args.filename,
+        link_mode="linked" if getattr(args, "link", False) else "import",
+        ctx=_ctx(args),
     ))
 
 
@@ -1434,14 +1692,9 @@ def cmd_open(args):
 
 
 def cmd_batch(args):
+    set_keys = _json_flag(args, "batch", "--set", args.set) if args.set else None
     setup_zotero_environment()
     _s, _r, _a, write_mod, _c = _import_tools()
-    set_keys = None
-    if args.set:
-        try:
-            set_keys = json.loads(args.set)
-        except json.JSONDecodeError as e:
-            _fail(args, "batch", f"invalid JSON in --set: {e}", "bad_json")
     _out(args, "batch", text=write_mod.batch_update(
         item_keys=_split_csv(args.item_keys), query=args.query or "",
         tag=_split_tags(args.tag), add_tags=_split_tags(args.add_tags),
@@ -1452,6 +1705,7 @@ def cmd_batch(args):
 
 def _fail(args, command: str, message: str, code: str = "error"):
     """Report a usage error in whichever shape the caller asked for, then exit."""
+    _flush_errors(args, f"Error: {message}")
     if _json_mode(args):
         _cli_json.emit_error(command, message, code=code)
     else:
@@ -1493,24 +1747,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the --json envelope contract and exit",
     )
 
-    sub = parser.add_subparsers(dest="command", help="Command to run")
-    # Every subcommand accepts the global flags after its own name too, so
-    # both `zotero-cli --json search x` and `zotero-cli search --json x` work.
-    # SUPPRESS is load-bearing: without it each subparser would write its own
-    # default into the namespace and silently undo a flag given before the
-    # subcommand name.
-    _sub_add_parser = sub.add_parser
+    # Every subcommand, nested ones included, accepts the global flags after
+    # its own name too, so `zotero-cli --json get metadata K`, `get --json
+    # metadata K` and `get metadata K --json` all work. SUPPRESS is
+    # load-bearing: without it each subparser would write its own default
+    # into the namespace and silently undo a flag given before its name.
+    def with_global_flags(subparsers):
+        plain_add_parser = subparsers.add_parser
 
-    def add_parser(*args, **kwargs):
-        p = _sub_add_parser(*args, **kwargs)
-        p.add_argument("-v", "--verbose", action="store_true",
-                       default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-        p.add_argument("--json", action="store_true", dest="json_out",
-                       default=argparse.SUPPRESS,
-                       help="Emit a JSON envelope instead of markdown")
-        return p
+        def add_parser(*args, **kwargs):
+            # A command's own option wins the name: `add csl-json --json TEXT`
+            # is the payload there, and the envelope flag goes before it.
+            kwargs.setdefault("conflict_handler", "resolve")
+            p = plain_add_parser(*args, **kwargs)
+            p.add_argument("-v", "--verbose", action="store_true",
+                           default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+            p.add_argument("--json", action="store_true", dest="json_out",
+                           default=argparse.SUPPRESS,
+                           help="Emit a JSON envelope instead of markdown")
+            return p
 
-    sub.add_parser = add_parser
+        subparsers.add_parser = add_parser
+        return subparsers
+
+    sub = with_global_flags(parser.add_subparsers(dest="command", help="Command to run"))
 
     # config
     cfg_p = sub.add_parser("config", help="Show current Zotero configuration")
@@ -1523,6 +1783,9 @@ def build_parser() -> argparse.ArgumentParser:
                      default="items", help="Search mode (default: items)")
     s_p.add_argument("--qmode", choices=["titleCreatorYear", "everything"],
                      default="titleCreatorYear")
+    s_p.add_argument("--level", choices=["articles", "passages"],
+                     help="With --mode semantic: search articles or passages "
+                          "(default: passages when chunking is on, articles when off)")
     s_p.add_argument("--collection", help="Scope to a collection key")
     s_p.add_argument("--limit", type=int, default=10)
     s_p.add_argument("--conditions", help='JSON conditions for advanced mode')
@@ -1542,7 +1805,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # get
     g_p = sub.add_parser("get", help="Get items, collections, tags, etc.", aliases=["g"])
-    g_sub = g_p.add_subparsers(dest="subcommand")
+    g_sub = with_global_flags(g_p.add_subparsers(dest="subcommand"))
     gm = g_sub.add_parser("metadata", help="Get item metadata")
     gm.add_argument("item_key")
     gm.add_argument("--no-abstract", action="store_true")
@@ -1576,28 +1839,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     # annotations
     a_p = sub.add_parser("annotations", help="Manage annotations", aliases=["ann"])
-    a_sub = a_p.add_subparsers(dest="subcommand")
+    a_sub = with_global_flags(a_p.add_subparsers(dest="subcommand"))
     al = a_sub.add_parser("list", help="Get annotations")
     al.add_argument("--item-key")
     al.add_argument("--pdf-extraction", action="store_true")
     al.add_argument("--limit", type=int, default=100)
     al.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    al.add_argument("--positions", action="store_true",
+                    help="Add each stored position to the JSON: page_index, rects (PDF points), "
+                         "rect (x,y,w,h, as update --rect takes)")
     au = a_sub.add_parser("update", help="Update an existing annotation")
     au.add_argument("annotation_key")
     au.add_argument("--text")
     au.add_argument("--comment")
     au.add_argument("--color")
+    au.add_argument("--rect", help="Move or resize an area box: x,y,width,height, normalized 0-1")
+    au.add_argument("--page", type=int, help="Move an area box to this page")
     au.add_argument("--add-tags", help=f"Tags to add ({TAG_LIST_HELP})")
     au.add_argument("--remove-tags", help=f"Tags to remove ({TAG_LIST_HELP})")
     ad = a_sub.add_parser("delete", help="Delete an annotation")
     ad.add_argument("annotation_key")
-    ac = a_sub.add_parser("create", help="Create a highlight (--text), an area box (--rect) "
-                                         "or a sticky note (--note)")
+    ac = a_sub.add_parser("create", help="Create a highlight (--text; with --underline, an "
+                                         "underline), an area box (--rect) or a sticky note (--note)")
     ac.add_argument("--attachment-key", required=True)
     ac.add_argument("--page", required=True, type=int)
     ac.add_argument("--text", help="Exact text to highlight")
+    ac.add_argument("--underline", action="store_true",
+                    help="Underline --text instead of highlighting it")
     ac.add_argument("--rect", help="Area box x,y,width,height, normalized 0-1; "
-                                   "`zotero-cli layout` prints boxes for figures and tables")
+                                   "`zotero-cli layout` prints boxes for figures and tables; "
+                                   "`auto` tightens --near to the figure or panel under it")
+    ac.add_argument("--near", help="With --rect auto: x,y,width,height hint, kept if the fit moves an edge over 0.03")
     ac.add_argument("--note", help="Sticky note centered at x,y, normalized 0-1; "
                                    "its text is --comment")
     ac.add_argument("--comment")
@@ -1610,20 +1882,34 @@ def build_parser() -> argparse.ArgumentParser:
     ab.add_argument("--attachment-key", required=True,
                     help="Attachment for lines that do not name their own")
     ab.add_argument("--file", default="-",
-                    help="JSON Lines (or a JSON array) of {page, text|rect|note, comment, color, tags}; "
+                    help="JSON Lines (or a JSON array) of {page, text|rect|note, underline, comment, "
+                         "color, tags}, rect may be auto; "
                          "- reads stdin")
     ab.add_argument("--dry-run", action="store_true",
-                    help="Locate every highlight and report what it would cover, without writing")
+                    help="Locate every highlight and underline and report what it would cover, "
+                         "without writing")
+    ab.add_argument("--render", metavar="DIR",
+                    help="With --dry-run: draw the plan on page PNGs in DIR")
+    ab.add_argument("--on-existing", choices=["skip", "replace"],
+                    help="Skip, or replace, entries already there (same page and first 40 "
+                         "characters of comment)")
+    ap = a_sub.add_parser("preview", help="Draw an attachment's stored annotations on page images")
+    ap.add_argument("--attachment-key", required=True)
+    ap.add_argument("--pages", default="all", help="all (default), 3, 3-6, or 1,4,6-9")
+    ap.add_argument("--out", metavar="DIR", help="Folder for the PNGs (default: a new temp folder)")
+    ap.add_argument("--scale", type=float, default=1.5, help="Pixels per PDF point")
 
     # layout -- figure/table boxes to aim area annotations at
     ly_p = sub.add_parser("layout", help="Find figure and table boxes on PDF pages")
     ly_p.add_argument("attachment_key")
     ly_p.add_argument("--pages", default="all",
                       help="Pages to scan: all (default), 3, 3-6, or 1,4,6-9")
+    ly_p.add_argument("--panels", action="store_true",
+                      help="Also box each figure panel, from its panel letter (A, B, C ...)")
 
     # notes
     n_p = sub.add_parser("notes", help="Manage notes", aliases=["n"])
-    n_sub = n_p.add_subparsers(dest="subcommand")
+    n_sub = with_global_flags(n_p.add_subparsers(dest="subcommand"))
     nl = n_sub.add_parser("list", help="List notes")
     nl.add_argument("--item-key")
     nl.add_argument("--limit", type=int, default=20)
@@ -1645,7 +1931,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # add
     add_p = sub.add_parser("add", help="Add items to your library")
-    add_sub = add_p.add_subparsers(dest="subcommand")
+    add_sub = with_global_flags(add_p.add_subparsers(dest="subcommand"))
 
     def _add_common_flags(p):
         """Collection/idempotency flags shared by every `add` subcommand."""
@@ -1670,7 +1956,15 @@ def build_parser() -> argparse.ArgumentParser:
     adoi = add_sub.add_parser("doi", help="Add item by DOI")
     adoi.add_argument("doi")
     _add_common_flags(adoi)
-    adoi.add_argument("--attach-mode", choices=["auto", "linked_url", "import_file", "none", "required"], default="auto")
+    adoi.add_argument("--attach-mode", choices=["auto", "linked_url", "import_file", "none", "required"],
+                      help="default auto; none with --attach-file")
+    adoi.add_argument("--attach-file", metavar="PATH", help="Attach this local PDF instead of fetching one")
+    afol = add_sub.add_parser("folder", help="Add every PDF in a folder by its DOI, attaching the file")
+    afol.add_argument("folder")
+    afol.add_argument("-c", "--collection", action="append", metavar="SPEC", help="Collection (repeatable)")
+    afol.add_argument("--tags", help=f"Tags ({TAG_LIST_HELP})")
+    afol.add_argument("--if-exists", dest="if_exists", choices=["file", "skip", "duplicate"], default="file")
+    afol.add_argument("--dry-run", action="store_true", help="Only show each PDF's DOI")
     aurl = add_sub.add_parser("url", help="Add item by URL")
     aurl.add_argument("url")
     _add_common_flags(aurl)
@@ -1706,7 +2000,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # collections
     col_p = sub.add_parser("collections", help="Manage collections", aliases=["coll"])
-    col_sub = col_p.add_subparsers(dest="subcommand")
+    col_sub = with_global_flags(col_p.add_subparsers(dest="subcommand"))
     ccs = col_sub.add_parser("create", help="Create a collection")
     ccs.add_argument("name")
     ccs.add_argument("--parent")
@@ -1721,17 +2015,6 @@ def build_parser() -> argparse.ArgumentParser:
     cmg.add_argument("--item-keys", required=True)
     cmg.add_argument("--add-to")
     cmg.add_argument("--remove-from")
-
-    # tags
-    t_p = sub.add_parser("tags", help="Deprecated: use batch --add-tags/--remove-tags")
-    t_p.add_argument("--item-keys",
-                     help="Comma-separated item keys to edit; --query and --tag are then ignored")
-    t_p.add_argument("--query")
-    t_p.add_argument("--tag", help=f"Select items by tag ({TAG_LIST_HELP}; any matches)")
-    t_p.add_argument("--add", help=f"Tags to add ({TAG_LIST_HELP})")
-    t_p.add_argument("--remove", help=f"Tags to remove ({TAG_LIST_HELP})")
-    t_p.add_argument("--limit", type=int, default=50,
-                     help="Most items to select by --query/--tag (at most 1000)")
 
     # edit (item metadata)
     e_p = sub.add_parser("edit", help="Edit metadata fields of an existing item")
@@ -1770,7 +2053,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # duplicates
     d_p = sub.add_parser("duplicates", help="Find or merge duplicate items")
-    d_sub = d_p.add_subparsers(dest="subcommand")
+    d_sub = with_global_flags(d_p.add_subparsers(dest="subcommand"))
     df = d_sub.add_parser("find")
     df.add_argument("--method", choices=["title", "doi", "both"], default="both")
     df.add_argument("--collection")
@@ -1782,24 +2065,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # db
     db_p = sub.add_parser("db", help="Manage the semantic search database")
-    db_sub = db_p.add_subparsers(dest="subcommand")
-    dbu = db_sub.add_parser("update")
-    dbu.add_argument("--force-rebuild", action="store_true")
-    dbu.add_argument("--limit", type=int)
-    dbu.add_argument("--fulltext", action="store_true")
-    dbu.add_argument("--allow-mass-deletion", action="store_true")
-    dbu.add_argument("--config-path")
-    dbu.add_argument("--db-path")
-    dbu_batch = dbu.add_mutually_exclusive_group()
-    dbu_batch.add_argument("--openai-batch", dest="openai_batch", action="store_true")
-    dbu_batch.add_argument("--no-openai-batch", dest="openai_batch", action="store_false")
-    dbu.set_defaults(openai_batch=None)
-    dbbs = db_sub.add_parser("batch-status")
-    dbbs.add_argument("--batch-id", action="append")
-    dbbs.add_argument("--config-path")
-    dbbi = db_sub.add_parser("batch-import")
-    dbbi.add_argument("--batch-id", action="append")
-    dbbi.add_argument("--config-path")
+    db_sub = with_global_flags(db_p.add_subparsers(dest="subcommand"))
+    add_update_db_arguments(db_sub.add_parser("update"))
+    add_batch_status_arguments(db_sub.add_parser("batch-status"))
+    add_batch_import_arguments(db_sub.add_parser("batch-import"))
     dbs = db_sub.add_parser("status")
     dbs.add_argument("--config-path")
     dbi = db_sub.add_parser("inspect")
@@ -1836,19 +2105,24 @@ def build_parser() -> argparse.ArgumentParser:
                       help="image writes PNG page images (up to 10 pages) for math, figures and tables")
     rd_p.add_argument("--rect", help="With --format image: crop the start page to x,y,width,height "
                                      "(normalized 0-1), e.g. from `zotero-cli layout`")
+    rd_p.add_argument("--grid", action="store_true",
+                      help="With --format image: draw a labelled 0.05 grid in page coordinates")
     rd_p.add_argument("--out", help="With --format image: directory for the PNG files "
                                     "(default: a new temporary directory)")
 
     # attach
     at_p = sub.add_parser("attach", help="Attach a file or link a URL to an item")
     at_p.add_argument("item_key")
-    at_p.add_argument("--file", help="Path to a local file to upload")
+    at_p.add_argument("--file", help="Path to a local file to upload (or to link in place, with --link)")
     at_p.add_argument("--url", help="URL to attach as a link")
     at_p.add_argument("--filename", help="Override the stored filename")
+    at_p.add_argument("--link", action="store_true",
+                      help="With --file: link the file where it is instead of uploading a copy "
+                           "(Zotero's 'Add Link to File'; uses no cloud storage)")
 
     # delete
     del_p = sub.add_parser("delete", help="Delete an item, collection or annotation")
-    del_sub = del_p.add_subparsers(dest="subcommand")
+    del_sub = with_global_flags(del_p.add_subparsers(dest="subcommand"))
     di = del_sub.add_parser("item")
     di.add_argument("item_key")
     di.add_argument("--allow-note", action="store_true",
@@ -1927,7 +2201,6 @@ _CMD_MAP = {
     "notes": cmd_notes, "n": cmd_notes,
     "add": cmd_add,
     "collections": cmd_collections, "coll": cmd_collections,
-    "tags": cmd_tags,
     "edit": cmd_edit,
     "duplicates": cmd_duplicates,
     "db": cmd_db,
@@ -1965,7 +2238,7 @@ never disagree.
 Commands returning structured data
 ----------------------------------
   search                data.items[]  -- item projections, in rank order
-  get metadata          the raw Zotero item record
+  get metadata          the Zotero item record (signed attachment URLs omitted)
   get collection-items  data.items[], data.offset, data.count
   get children          data.items[]
   get recent            data.items[]
@@ -1990,7 +2263,7 @@ Item projection (--detail keys_only | summary | full)
   keys_only  key, itemType, title, date  (+ deleted when trashed)
   summary    the above + creators[], doi, publication, url, tags[],
              collections[]
-  full       the above + abstract, raw (the complete Zotero data dict)
+  full       the above + abstract, raw (Zotero data with signed attachment URLs omitted)
 
 `title` resolves type-specific base fields (a statute's nameOfAct, a
 note's first line), so it is never the literal "Untitled" for an item
@@ -2004,6 +2277,11 @@ fields are not removed or retyped without bumping it. Parse defensively.
 
 
 def main():
+    # Before any tool module is imported: this process never serves MCP,
+    # so the tools skip loading FastMCP (about half a second per command).
+    from zotero_mcp import _serverless
+
+    _serverless.enable()
     tolerate_console_encoding()
     parser = build_parser()
     args = parser.parse_args()
@@ -2024,12 +2302,14 @@ def main():
     try:
         handler(args)
     except KeyboardInterrupt:
+        _flush_errors(args)
         if _json_mode(args):
             _cli_json.emit_error(args.command, "Interrupted", code="interrupted")
         else:
             print("\nInterrupted.", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
+        _flush_errors(args, f"Error: {e}")
         # In JSON mode the failure has to arrive in the same shape as a
         # success, or a caller has to parse stderr to find out what happened.
         if _json_mode(args):
@@ -2044,6 +2324,9 @@ def main():
             import traceback
             traceback.print_exc()
         sys.exit(1)
+    finally:
+        # Commands that exit or return without going through _out.
+        _flush_errors(args)
 
 
 if __name__ == "__main__":
