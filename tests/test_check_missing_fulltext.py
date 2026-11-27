@@ -148,7 +148,7 @@ def test_zotero_db_is_opened_immutable(monkeypatch):
     assert "mode=ro" not in seen["dsn"]
 
 
-def _fixture_zotero_db(path, trashed_keys=()):
+def _fixture_zotero_db(path, trashed_keys=(), link_only_keys=()):
     """A minimal zotero.sqlite holding two PDF-owning items."""
     import sqlite3
 
@@ -160,16 +160,20 @@ def _fixture_zotero_db(path, trashed_keys=()):
         CREATE TABLE itemDataValues (valueID INTEGER PRIMARY KEY, value TEXT);
         CREATE TABLE itemCreators (itemID INTEGER, creatorID INTEGER, orderIndex INTEGER);
         CREATE TABLE creators (creatorID INTEGER PRIMARY KEY, firstName TEXT, lastName TEXT);
-        CREATE TABLE itemAttachments (itemID INTEGER, parentItemID INTEGER, contentType TEXT);
+        CREATE TABLE itemAttachments (itemID INTEGER, parentItemID INTEGER, contentType TEXT, linkMode INTEGER);
         CREATE TABLE deletedItems (itemID INTEGER PRIMARY KEY);
         INSERT INTO itemTypes VALUES (1, 'journalArticle'), (2, 'attachment');
     """)
-    for i, key in enumerate(("KEEPME01", "TRASHED1"), start=1):
+    keys = ("KEEPME01", "TRASHED1", *link_only_keys)
+    for i, key in enumerate(keys, start=1):
         conn.execute("INSERT INTO items VALUES (?,?,1)", (i, key))
         conn.execute("INSERT INTO itemDataValues VALUES (?,?)", (i, f"Title {key}"))
         conn.execute("INSERT INTO itemData VALUES (?,1,?)", (i, i))
         conn.execute("INSERT INTO items VALUES (?,?,2)", (100 + i, f"ATT{i}"))
-        conn.execute("INSERT INTO itemAttachments VALUES (?,?,'application/pdf')", (100 + i, i))
+        conn.execute(
+            "INSERT INTO itemAttachments VALUES (?,?,'application/pdf',?)",
+            (100 + i, i, 3 if key in link_only_keys else 1),
+        )
         if key in trashed_keys:
             conn.execute("INSERT INTO deletedItems VALUES (?)", (i,))
     conn.commit()
@@ -292,3 +296,14 @@ def test_real_split_index_is_aggregated_across_both_collections(tmp_path):
 
     assert indexed["GGGG7777"] == {"length": 2000, "chunks": 2, "has_fulltext": True}
     assert indexed["HHHH8888"]["has_fulltext"] == "failed"
+
+
+def test_linked_url_to_a_pdf_is_not_reported_as_missing(tmp_path, monkeypatch):
+    """A "PDF" link attachment (linkMode 3) has no file to index."""
+    from zotero_mcp import check_missing_fulltext as cmf
+
+    db = tmp_path / "zotero.sqlite"
+    _fixture_zotero_db(db, link_only_keys=("LINKONLY",))
+    monkeypatch.setattr(cmf, "find_zotero_db", lambda: str(db))
+
+    assert "LINKONLY" not in cmf.get_items_with_pdf_attachments()

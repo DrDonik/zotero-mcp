@@ -82,6 +82,9 @@ def get_items_with_pdf_attachments():
             SELECT 1 FROM itemAttachments ia
             WHERE ia.parentItemID = i.itemID
             AND ia.contentType = 'application/pdf'
+            -- A linked URL (linkMode 3) to a PDF is a bookmark, not a file:
+            -- there is nothing on disk to index, so it is no failure.
+            AND ia.linkMode != 3
         )
     """
 

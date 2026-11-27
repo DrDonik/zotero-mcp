@@ -365,3 +365,62 @@ def test_legacy_record_without_attachment_keys_is_not_reextracted(monkeypatch):
     items, reader = _run_scan(monkeypatch, stored, attachments=attachments)
     assert items == []
 
+
+
+# ---------------------------------------------------------------------------
+# Links and unreadable formats are not extraction failures
+# ---------------------------------------------------------------------------
+
+LINK_ONLY = [("LINKATT1", None, "application/pdf")]
+UNREADABLE = [("DOCXATT1", "storage:slides.pptx",
+               "application/vnd.openxmlformats-officedocument.presentationml.presentation")]
+
+
+@pytest.mark.parametrize("attachments", [LINK_ONLY, UNREADABLE])
+def test_link_or_unreadable_attachment_is_not_marked_failed(monkeypatch, attachments):
+    """A "PDF" link or a .pptx yields no text by design, not by failure."""
+    items, reader, search = _run_scan_no_text(monkeypatch, None, attachments=attachments)
+    assert len(items) == 1
+    assert items[0]["data"]["fulltext_attempted"] is False
+    assert "has_fulltext" not in search._create_metadata(items[0])
+
+
+@pytest.mark.parametrize("attachments", [LINK_ONLY, UNREADABLE])
+def test_legacy_failed_marker_on_link_only_item_leaves_report(
+    monkeypatch, capsys, attachments
+):
+    """Markers written before this fix stay skipped but are not reported
+    as PDF extraction failures."""
+    stored = {
+        "has_fulltext": "failed",
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": attachments[0][0],
+    }
+    items, reader, _search = _run_scan_no_text(monkeypatch, stored, attachments=attachments)
+    assert items == []
+    assert reader.extract_calls == 0
+    err = capsys.readouterr().err
+    assert "PDF extraction previously failed" not in err
+    assert "remain metadata-only" in err
+
+
+def test_metadata_only_link_item_is_not_reindexed_every_run(monkeypatch):
+    """Once metadata-only, a link-only item must count as up to date."""
+    stored = {"date_modified": DATE_MODIFIED, "attachment_keys": "LINKATT1"}
+    items, reader = _run_scan(monkeypatch, stored, attachments=LINK_ONLY)
+    assert items == []
+    assert reader.extract_calls == 0
+
+
+def test_missing_file_still_counts_as_failure(monkeypatch):
+    """A recorded file that is gone from disk is a failure the user can fix."""
+    attachments = [("SNAPATT1", "storage:page.html", "text/html")]
+    items, reader, search = _run_scan_no_text(monkeypatch, None, attachments=attachments)
+    assert search._create_metadata(items[0])["has_fulltext"] == "failed"
+
+
+def test_edited_metadata_only_link_item_is_reindexed(monkeypatch):
+    """Without a text marker, the item's date is what shows an edit."""
+    stored = {"date_modified": "2026-06-30 12:00:00", "attachment_keys": "LINKATT1"}
+    items, reader = _run_scan(monkeypatch, stored, attachments=LINK_ONLY)
+    assert [it["key"] for it in items] == ["ITEMKEY1"]

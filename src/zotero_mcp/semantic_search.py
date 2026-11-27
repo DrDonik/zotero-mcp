@@ -45,7 +45,7 @@ from .config_light import (  # noqa: F401
 )
 from .embeddings.base import EmbeddingAPIUnreachable
 from .embeddings.registry import batch_capable_providers
-from .extract import PAGE_SEPARATOR
+from .extract import PAGE_SEPARATOR, categorize_attachment
 from .identifiers import metadata_match_keys
 from .local_db import PERSONAL_LIBRARY_GROUP_ID, LocalZoteroReader
 from .utils import (
@@ -628,6 +628,29 @@ def _same_moment(first: Any, second: Any) -> bool:
 
     a, b = parse(first), parse(second)
     return a is not None and a == b
+
+
+def _has_text_bearing_attachment(attachments) -> bool:
+    """Whether any attachment could ever yield text for the index.
+
+    ``attachments`` are the ``(key, path, content_type)`` rows of
+    ``get_fulltext_meta_for_item``. A linked URL has no path, and a .docx,
+    image or video is a file we never read: an item whose attachments are all
+    of that kind has nothing to extract, so a run that gets no text from it
+    has not *failed* and must not land in the "PDF extraction previously
+    failed" report (#446). EPUBs count, since Zotero's own
+    ``.zotero-ft-cache`` covers them. A file that should exist but is missing
+    on disk still counts: that is a failure the user can fix.
+    """
+    for _key, path, ctype in attachments:
+        if not path:
+            continue
+        if categorize_attachment(path, ctype) is not None:
+            return True
+        suffix = str(path).lower().rsplit(".", 1)[-1]
+        if (ctype or "").lower().startswith("application/epub") or suffix == "epub":
+            return True
+    return False
 
 
 def _attachment_priority_changed(existing_metadata: dict, current_tag: str) -> bool:
@@ -2313,10 +2336,12 @@ class ZoteroSemanticSearch:
                         # later run can detect attachment changes. Attaching a
                         # file does NOT bump the parent's dateModified, so the
                         # date check alone never clears a "failed" marker.
-                        att_keys = ",".join(
-                            sorted(k for k, _p, _c in reader.get_fulltext_meta_for_item(it.item_id))
-                        )
+                        att_meta = reader.get_fulltext_meta_for_item(it.item_id)
+                        att_keys = ",".join(sorted(k for k, _p, _c in att_meta))
                         it._attachment_keys = att_keys
+                        # Only these can fail an extraction; links and
+                        # unreadable formats leave the item metadata-only.
+                        it._has_text_source = _has_text_bearing_attachment(att_meta)
                         it._attachment_priority = priority_tag
 
                         # CHECK IF ITEM ALREADY EXISTS (unless force_rebuild or no client)
@@ -2335,7 +2360,10 @@ class ZoteroSemanticSearch:
                                 updated_existing += 1
                             elif existing_metadata:
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
-                                local_has_fulltext = bool(att_keys)
+                                # Text-bearing attachments only: counting a
+                                # bare link here would re-index a
+                                # metadata-only item on every run.
+                                local_has_fulltext = it._has_text_source
 
                                 # Skip if extraction previously failed AND neither the item
                                 # nor its attachment set has changed since (handles both a
@@ -2349,13 +2377,15 @@ class ZoteroSemanticSearch:
                                         # Nothing changed since the failure — don't retry
                                         should_extract = False
                                         skipped_existing += 1
-                                        if att_keys:
+                                        if it._has_text_source:
                                             _skipped_failed.append(display or f"item {it.key}")
                                         else:
                                             # Legacy "failed" marker on an item
-                                            # with no text-bearing attachments:
-                                            # nothing ever failed, there was
-                                            # nothing to try (#446).
+                                            # with no text-bearing attachments
+                                            # (none at all, or only links,
+                                            # .docx, images…): nothing ever
+                                            # failed, there was nothing to
+                                            # try (#446).
                                             _skipped_no_source += 1
                                     else:
                                         # Item or its attachments changed since last
@@ -2381,6 +2411,16 @@ class ZoteroSemanticSearch:
                                     updated_existing += 1
                                 elif not chroma_has_fulltext and local_has_fulltext:
                                     # Document exists but lacks fulltext - we need to update it
+                                    updated_existing += 1
+                                elif not chroma_has_fulltext and not _same_moment(
+                                    existing_metadata.get("date_modified", ""),
+                                    getattr(it, "date_modified", "") or "",
+                                ):
+                                    # Metadata-only record (no attachments, or
+                                    # only links / unreadable formats) whose
+                                    # item was edited: its title and abstract
+                                    # are all the index holds, so re-index
+                                    # rather than keep serving the old ones.
                                     updated_existing += 1
                                 elif _attachment_priority_changed(
                                     existing_metadata, priority_tag
@@ -2437,7 +2477,7 @@ class ZoteroSemanticSearch:
                                 target.fulltext, target.fulltext_source = result
                                 if text_cap and len(target.fulltext or "") > text_cap:
                                     target.fulltext = target.fulltext[:text_cap]
-                            elif getattr(target, "_attachment_keys", ""):
+                            elif getattr(target, "_has_text_source", False):
                                 # An attachment existed but produced no text —
                                 # record the attempt so incremental runs don't
                                 # re-parse it until something changes.
